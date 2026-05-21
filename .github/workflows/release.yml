@@ -15,6 +15,11 @@ permissions:
   contents: write
   id-token: write
 
+env:
+  # Opt into Node.js 24 for JavaScript actions (actions/checkout, setup-node,
+  # upload-artifact, ...). Default flips automatically on 2026-06-02.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-rust:
     name: build-rust (${{ matrix.triple }})
