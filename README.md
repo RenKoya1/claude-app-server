@@ -22,31 +22,60 @@ typed while letting the SDK update itself with Claude Code releases.
 > standalone server that lets you build your own client on top of the
 > Claude agent. Authentication piggybacks on `claude login`.
 
-## Install
+## Install (users)
 
 ```bash
-npx @renkoya1/claude-app-server          # one-off
-npm i -g @renkoya1/claude-app-server     # global
+npx @renkoya1/claude-app-server          # one-off run
+npm i -g @renkoya1/claude-app-server     # install globally
 ```
 
-The npm package ships:
-- `bin/launcher.mjs` — small Node wrapper that locates the Rust binary +
-  sidecar and forwards stdio.
-- `dist/sidecar/` — compiled TypeScript sidecar that talks to
-  `@anthropic-ai/claude-agent-sdk`.
-- `dist/bin/<platform>/claude-app-server` — Rust binary for your platform,
-  downloaded by `postinstall` from GitHub Releases (or built locally with
-  `npm run build`).
+That's the whole install. `npm install` runs a `postinstall` step that
+downloads the Rust binary for your platform from this package's GitHub
+Release. Supported platforms: `darwin-arm64`, `darwin-x64`, `linux-x64`,
+`linux-arm64`.
 
-If `postinstall` cannot find a release (e.g. you cloned the repo), run
-`npm run build` from the package root to build everything locally:
+The package ships:
+- `bin/launcher.mjs` — Node wrapper that exec's the Rust binary.
+- `dist/sidecar/` — compiled TypeScript sidecar bundling
+  `@anthropic-ai/claude-agent-sdk`.
+- `dist/bin/<platform>/claude-app-server` — Rust binary for your platform.
+
+## Authentication
+
+This server uses `@anthropic-ai/claude-agent-sdk`, which is the same
+engine that powers the `claude` CLI / Claude Code app. **If you have
+already run `claude login`, you do not need any environment variables.**
+
+Credential resolution order (same as the official `claude` CLI):
+
+1. `ANTHROPIC_API_KEY` env var, if set, takes precedence.
+2. OAuth tokens written by `claude login`:
+   - macOS: Keychain entry `Claude Code-credentials`.
+   - Linux / Windows: `~/.claude/.credentials.json`.
+3. AWS Bedrock / Google Vertex credentials, if configured for the SDK.
+
+So the two usual setups are:
 
 ```bash
-git clone <this repo>
-cd claude
-npm install                    # installs sidecar runtime + launcher
-npm run build                  # cargo + tsc + stage dist/
-node bin/launcher.mjs          # smoke test the wrapper
+# You already use Claude Code — nothing to do.
+claude login                                  # one-time
+npx @renkoya1/claude-app-server
+
+# Or you want raw API key access (no Claude subscription):
+ANTHROPIC_API_KEY=sk-ant-... npx @renkoya1/claude-app-server
+```
+
+## Build from source (contributors)
+
+You only need this section if you cloned the repo to develop the server
+itself. End users should use `npx` above.
+
+```bash
+git clone https://github.com/RenKoya1/claude-app-server.git
+cd claude-app-server
+npm install                    # installs launcher + sidecar runtime deps
+npm run build                  # cargo build --release + tsc + stage dist/
+node bin/launcher.mjs          # smoke test
 ```
 
 ## Run
@@ -67,31 +96,18 @@ Drive it from your client:
 You will see `item/agentMessage/delta` notifications stream the response,
 followed by a final `turn/completed` with token usage.
 
-### Environment variables
+### Environment variables (all optional)
 
 | Var                            | Meaning                                                                 |
 |--------------------------------|-------------------------------------------------------------------------|
-| `ANTHROPIC_API_KEY`            | optional; falls through to the sidecar which feeds it to the SDK.       |
 | `ANTHROPIC_MODEL`              | default model when `thread/start` omits one.                            |
+| `ANTHROPIC_API_KEY`            | raw API key. Only needed if you don't use `claude login` for auth.      |
 | `CLAUDE_HOME`                  | reported as `codexHome` in `initialize` (default `~/.claude`).          |
 | `CLAUDE_APP_SERVER_SIDECAR`    | override the sidecar script path. Auto-set by the launcher.             |
 | `CLAUDE_APP_SERVER_SKIP_DOWNLOAD=1` | skip the postinstall binary download.                              |
 | `CLAUDE_APP_SERVER_RELEASE_URL` | override the binary download template used by postinstall.            |
 | `RUST_LOG`                     | tracing filter, e.g. `info,claude_app_server=debug`.                    |
 | `LOG_FORMAT=json`              | emit JSON tracing lines on stderr.                                      |
-
-### Auth
-
-The sidecar uses `@anthropic-ai/claude-agent-sdk`, which resolves
-credentials in the same order as `claude login`:
-
-1. `ANTHROPIC_API_KEY` environment variable.
-2. OAuth tokens written by `claude login` (macOS Keychain entry
-   `Claude Code-credentials`; Linux/Windows
-   `~/.claude/.credentials.json`).
-
-If you already use Claude Code, this server will pick up your credentials
-automatically; no further configuration is required.
 
 ## Protocol overview
 

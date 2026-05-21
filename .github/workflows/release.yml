@@ -26,7 +26,11 @@ jobs:
             os: macos-14
             rust_target: aarch64-apple-darwin
           - triple: darwin-x64
-            os: macos-13
+            # Cross-compile to Intel from Apple Silicon: macos-13 (Intel)
+            # runners are heavily queued and effectively deprecated; macos-14
+            # builds x86_64-apple-darwin natively with the bundled rustup
+            # toolchain.
+            os: macos-14
             rust_target: x86_64-apple-darwin
           - triple: linux-x64
             os: ubuntu-22.04
