@@ -25,8 +25,8 @@ typed while letting the SDK update itself with Claude Code releases.
 ## Install
 
 ```bash
-npx claude-app-server          # one-off
-npm i -g claude-app-server     # global
+npx @renkoya1/claude-app-server          # one-off
+npm i -g @renkoya1/claude-app-server     # global
 ```
 
 The npm package ships:
@@ -230,3 +230,49 @@ initialize handshake before sending other requests.)
 - The bundled binary is downloaded on `npm install`. Sandboxed CI
   environments without outbound HTTP need `CLAUDE_APP_SERVER_RELEASE_URL`
   pointing at a mirror or `npm run build` from a source checkout.
+
+## Publishing (maintainers)
+
+End-to-end release is a single command:
+
+```bash
+npm run release patch          # 0.1.0 -> 0.1.1
+npm run release minor          # 0.1.0 -> 0.2.0
+npm run release major          # 0.1.0 -> 1.0.0
+```
+
+What this does locally: cleanliness check, version bump, git tag, push.
+
+What GitHub Actions does once the tag lands
+(`.github/workflows/release.yml`):
+
+1. matrix-builds the Rust binary for `darwin-arm64`, `darwin-x64`,
+   `linux-x64`, `linux-arm64`,
+2. builds the TypeScript sidecar on a Linux runner,
+3. assembles `dist/sidecar/` + `dist/bin/<triple>/` on a single publish
+   job,
+4. creates a GitHub Release with per-platform tarballs attached,
+5. runs `npm publish --access public` against `@renkoya1/claude-app-server`.
+
+Prerequisites — these are one-time configuration on the GitHub
+repository:
+
+- `NPM_TOKEN` repository secret — a granular token with publish rights
+  to `@renkoya1/claude-app-server` (https://www.npmjs.com/settings/renkoya1/tokens).
+- Default `GITHUB_TOKEN` (no setup needed) — used by `gh release create`.
+
+If you want to ship a one-platform build from your laptop without going
+through CI (useful for dogfooding only):
+
+```bash
+npm run release patch -- --local
+```
+
+That bumps the version, builds the current platform, runs `npm publish`
+directly, and then pushes the tag.
+
+To preview the release flow without taking any action:
+
+```bash
+npm run release patch -- --dry-run
+```

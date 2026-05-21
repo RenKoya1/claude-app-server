@@ -1,5 +1,5 @@
 {
-  "name": "claude-app-server",
+  "name": "@renkoya1/claude-app-server",
   "version": "0.1.0",
   "description": "JSON-RPC server that exposes Claude Agent SDK to any client (codex app-server compatible wire protocol).",
   "type": "module",
@@ -18,7 +18,11 @@
     "build:sidecar": "cd sidecar && npm install && npx tsc -p tsconfig.json",
     "build:rust": "cargo build --release -p claude-app-server",
     "postinstall": "node scripts/postinstall.mjs",
-    "start": "node bin/launcher.mjs"
+    "start": "node bin/launcher.mjs",
+    "release": "node scripts/release.mjs",
+    "release:patch": "node scripts/release.mjs patch",
+    "release:minor": "node scripts/release.mjs minor",
+    "release:major": "node scripts/release.mjs major"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -34,6 +38,23 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RenKoya1/claude-app-server.git"
+  },
+  "homepage": "https://github.com/RenKoya1/claude-app-server#readme",
+  "bugs": {
+    "url": "https://github.com/RenKoya1/claude-app-server/issues"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "agent",
+    "sdk",
+    "json-rpc",
+    "app-server",
+    "codex"
+  ],
   "publishConfig": {
     "access": "public"
   },

@@ -1,0 +1,173 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.1). Required for manual run."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build-rust:
+    name: build-rust (${{ matrix.triple }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: darwin-arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+          - triple: darwin-x64
+            os: macos-13
+            rust_target: x86_64-apple-darwin
+          - triple: linux-x64
+            os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+          - triple: linux-arm64
+            os: ubuntu-22.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.rust_target }} -p claude-app-server
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist/bin/${{ matrix.triple }}
+          cp target/${{ matrix.rust_target }}/release/claude-app-server dist/bin/${{ matrix.triple }}/claude-app-server
+          chmod +x dist/bin/${{ matrix.triple }}/claude-app-server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.triple }}
+          path: dist/bin/${{ matrix.triple }}
+          if-no-files-found: error
+          retention-days: 7
+
+  build-sidecar:
+    name: build-sidecar
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+          cache-dependency-path: sidecar/package-lock.json
+      - name: Install sidecar deps
+        run: npm install
+        working-directory: sidecar
+      - name: Compile sidecar
+        run: npx tsc -p tsconfig.json
+        working-directory: sidecar
+      - name: Stage sidecar dist
+        run: |
+          rm -rf dist/sidecar
+          mkdir -p dist/sidecar
+          cp -R sidecar/dist/. dist/sidecar/
+          mkdir -p dist/sidecar/node_modules
+          rsync -a --delete sidecar/node_modules/ dist/sidecar/node_modules/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidecar
+          path: dist/sidecar
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [build-rust, build-sidecar]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate package version matches tag
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "${{ steps.tag.outputs.tag }}" ]; then
+            echo "package.json version ($PKG_VERSION) does not match tag (${{ steps.tag.outputs.tag }})" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all rust artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist/bin
+          merge-multiple: false
+
+      - name: Download sidecar artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar
+          path: dist/sidecar
+
+      - name: Restage rust binaries under dist/bin/<triple>
+        run: |
+          set -euxo pipefail
+          for d in dist/bin/bin-*; do
+            triple="${d##*/bin-}"
+            mkdir -p "dist/bin/${triple}"
+            cp -r "$d"/* "dist/bin/${triple}/"
+            chmod +x "dist/bin/${triple}/claude-app-server"
+            rm -rf "$d"
+          done
+          ls -la dist/bin
+
+      - name: Package per-platform tarballs for GitHub Release
+        run: |
+          set -euxo pipefail
+          mkdir -p release-assets
+          for triple in dist/bin/*; do
+            t=$(basename "$triple")
+            tar -czf "release-assets/claude-app-server-${t}.tar.gz" -C "$triple" .
+          done
+          ls -la release-assets
+
+      - name: Create GitHub Release with binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --generate-notes \
+            release-assets/*.tar.gz
+
+      - name: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CLAUDE_APP_SERVER_SKIP_DOWNLOAD: "1"
+        run: npm publish --access public
