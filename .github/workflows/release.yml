@@ -82,11 +82,14 @@ jobs:
           node-version: 22
           cache: "npm"
           cache-dependency-path: sidecar/package-lock.json
-      - name: Install sidecar deps
-        run: npm install
+      - name: Install sidecar deps (including dev for tsc)
+        run: npm ci
         working-directory: sidecar
       - name: Compile sidecar
         run: npx tsc -p tsconfig.json
+        working-directory: sidecar
+      - name: Prune sidecar to production deps only
+        run: npm prune --omit=dev
         working-directory: sidecar
       - name: Stage sidecar dist
         run: |
@@ -95,6 +98,8 @@ jobs:
           cp -R sidecar/dist/. dist/sidecar/
           mkdir -p dist/sidecar/node_modules
           rsync -a --delete sidecar/node_modules/ dist/sidecar/node_modules/
+          echo "==> Final sidecar size:"
+          du -sh dist/sidecar
       - uses: actions/upload-artifact@v4
         with:
           name: sidecar
