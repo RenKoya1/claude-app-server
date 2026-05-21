@@ -98,8 +98,21 @@ jobs:
           cp -R sidecar/dist/. dist/sidecar/
           mkdir -p dist/sidecar/node_modules
           rsync -a --delete sidecar/node_modules/ dist/sidecar/node_modules/
+
+          # We do not publish a win32 npm artifact (package.json os whitelist
+          # is darwin/linux), so the win32 ripgrep vendor binaries are pure
+          # dead weight (~12 MB). Strip them.
+          rm -rf "dist/sidecar/node_modules/@anthropic-ai/claude-agent-sdk/vendor/ripgrep/x64-win32" || true
+
+          # The Claude Agent SDK also ships a `cli.js` that is the full
+          # Claude Code CLI binary. We do not invoke that path from our
+          # sidecar, so it can be deleted to save ~11 MB. Comment out if
+          # the SDK starts requiring it at runtime.
+          # rm -f "dist/sidecar/node_modules/@anthropic-ai/claude-agent-sdk/cli.js" || true
+
           echo "==> Final sidecar size:"
           du -sh dist/sidecar
+          du -sh dist/sidecar/node_modules/@anthropic-ai/claude-agent-sdk/vendor/ripgrep || true
       - uses: actions/upload-artifact@v4
         with:
           name: sidecar

@@ -1,25 +1,24 @@
 #!/usr/bin/env node
 /**
- * postinstall: ensure dist/bin/<platform>/claude-app-server is present after
- * `npm install`.
+ * postinstall:
+ *   1. Ensure dist/bin/<platform>/claude-app-server is present, downloading
+ *      from GitHub Releases on first install.
+ *   2. Prune the Claude Agent SDK's bundled `ripgrep` vendor directories to
+ *      keep only the one matching the current platform, freeing ~40MB on
+ *      disk for users.
  *
  * Behavior:
- *   - If `CLAUDE_APP_SERVER_SKIP_DOWNLOAD=1`, do nothing.
+ *   - If `CLAUDE_APP_SERVER_SKIP_DOWNLOAD=1`, skip step 1.
  *   - If the binary already exists (e.g. local dev where build-local.sh ran),
- *     do nothing.
- *   - Otherwise, download a release tarball from GitHub Releases for the
- *     current platform and extract it into dist/bin/<triple>/.
- *
- * The download URL is templated from `release.binaryUrlTemplate` in
- * package.json so the same script works pre- and post-publish.
+ *     skip step 1.
+ *   - Step 2 always runs unless `CLAUDE_APP_SERVER_KEEP_VENDOR=1`.
  */
 
-import { existsSync, mkdirSync, createWriteStream, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, createWriteStream, chmodSync, rmSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { platform, arch } from "node:os";
 import { pipeline } from "node:stream/promises";
-import { createGunzip } from "node:zlib";
 import { spawn } from "node:child_process";
 import https from "node:https";
 
@@ -66,19 +65,76 @@ async function extractTarGz(tarball, destDir) {
   });
 }
 
-async function main() {
-  if (process.env.CLAUDE_APP_SERVER_SKIP_DOWNLOAD === "1") {
-    console.log("postinstall: skipped (CLAUDE_APP_SERVER_SKIP_DOWNLOAD=1)");
-    return;
+// Map our platform triple onto the SDK's ripgrep vendor directory name.
+// The SDK ships dirs like `arm64-darwin`, `x64-linux`, etc.
+function ripgrepVendorName(triple) {
+  switch (triple) {
+    case "darwin-arm64": return "arm64-darwin";
+    case "darwin-x64":   return "x64-darwin";
+    case "linux-x64":    return "x64-linux";
+    case "linux-arm64":  return "arm64-linux";
+    case "win32-x64":    return "x64-win32";
+    default:             return null;
   }
-  let triple;
-  try {
-    triple = platformTriple();
-  } catch (e) {
-    console.warn(`postinstall: ${e.message}; binary download skipped.`);
-    return;
-  }
+}
 
+function pruneRipgrepVendor(triple) {
+  if (process.env.CLAUDE_APP_SERVER_KEEP_VENDOR === "1") return;
+  const keep = ripgrepVendorName(triple);
+  if (!keep) return;
+  const vendorRoot = join(
+    PKG_ROOT,
+    "dist",
+    "sidecar",
+    "node_modules",
+    "@anthropic-ai",
+    "claude-agent-sdk",
+    "vendor",
+    "ripgrep",
+  );
+  if (!existsSync(vendorRoot)) return;
+  let entries;
+  try {
+    entries = readdirSync(vendorRoot);
+  } catch {
+    return;
+  }
+  let freed = 0;
+  for (const entry of entries) {
+    if (entry === keep) continue;
+    const full = join(vendorRoot, entry);
+    try {
+      const st = statSync(full);
+      if (st.isDirectory()) {
+        freed += dirSize(full);
+        rmSync(full, { recursive: true, force: true });
+      }
+    } catch {}
+  }
+  if (freed > 0) {
+    console.log(`postinstall: pruned ripgrep vendor (kept ${keep}, freed ${(freed / (1024 * 1024)).toFixed(1)} MB)`);
+  }
+}
+
+function dirSize(p) {
+  let total = 0;
+  try {
+    for (const entry of readdirSync(p, { withFileTypes: true })) {
+      const full = join(p, entry.name);
+      if (entry.isDirectory()) total += dirSize(full);
+      else if (entry.isFile()) {
+        try { total += statSync(full).size; } catch {}
+      }
+    }
+  } catch {}
+  return total;
+}
+
+async function ensureBinary(triple) {
+  if (process.env.CLAUDE_APP_SERVER_SKIP_DOWNLOAD === "1") {
+    console.log("postinstall: binary download skipped (CLAUDE_APP_SERVER_SKIP_DOWNLOAD=1)");
+    return;
+  }
   const ext = platform() === "win32" ? ".exe" : "";
   const binaryPath = join(PKG_ROOT, "dist", "bin", triple, `claude-app-server${ext}`);
   if (existsSync(binaryPath)) {
@@ -86,18 +142,9 @@ async function main() {
     return;
   }
 
-  // We have not published releases yet, so postinstall just logs and exits
-  // cleanly. When releases exist, set CLAUDE_APP_SERVER_RELEASE_URL or
-  // expand pkg.release.binaryUrlTemplate to point at the tarball.
   const tpl =
     process.env.CLAUDE_APP_SERVER_RELEASE_URL ||
-    "https://github.com/example/claude-app-server/releases/download/v{version}/claude-app-server-{triple}.tar.gz";
-  if (tpl.includes("example/claude-app-server")) {
-    console.warn(
-      "postinstall: no release URL configured. Run `npm run build` from the package root for local dev, or set CLAUDE_APP_SERVER_RELEASE_URL.",
-    );
-    return;
-  }
+    "https://github.com/RenKoya1/claude-app-server/releases/download/v{version}/claude-app-server-{triple}.tar.gz";
 
   const pkg = JSON.parse(
     await import("node:fs/promises").then((m) => m.readFile(join(PKG_ROOT, "package.json"), "utf8")),
@@ -113,10 +160,24 @@ async function main() {
   await extractTarGz(tarball, destDir);
   if (existsSync(binaryPath)) {
     chmodSync(binaryPath, 0o755);
+    try { rmSync(tarball); } catch {}
     console.log(`postinstall: installed ${binaryPath}`);
   } else {
     console.warn(`postinstall: tarball did not contain ${binaryPath}`);
   }
+}
+
+async function main() {
+  let triple;
+  try {
+    triple = platformTriple();
+  } catch (e) {
+    console.warn(`postinstall: ${e.message}; binary download skipped.`);
+    return;
+  }
+
+  await ensureBinary(triple);
+  pruneRipgrepVendor(triple);
 }
 
 main().catch((e) => {
