@@ -1,0 +1,23 @@
+# Source not shipped — distributable artifacts live under dist/.
+crates/
+sidecar/src/
+sidecar/node_modules/
+sidecar/dist/
+sidecar/tsconfig.json
+sidecar/package.json
+sidecar/package-lock.json
+target/
+Cargo.toml
+Cargo.lock
+codex/
+node_modules/
+*.log
+.DS_Store
+
+# Keep:
+# - bin/launcher.mjs
+# - dist/sidecar/**
+# - dist/bin/**
+# - scripts/postinstall.mjs
+# - package.json
+# - README.md

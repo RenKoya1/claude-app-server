@@ -1,0 +1,41 @@
+{
+  "name": "claude-app-server",
+  "version": "0.1.0",
+  "description": "JSON-RPC server that exposes Claude Agent SDK to any client (codex app-server compatible wire protocol).",
+  "type": "module",
+  "bin": {
+    "claude-app-server": "./bin/launcher.mjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "scripts/postinstall.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "./scripts/build-local.sh",
+    "build:sidecar": "cd sidecar && npm install && npx tsc -p tsconfig.json",
+    "build:rust": "cargo build --release -p claude-app-server",
+    "postinstall": "node scripts/postinstall.mjs",
+    "start": "node bin/launcher.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}
