@@ -367,6 +367,15 @@ export const Methods = {
   collaborationModeList: "collaborationMode/list",
   modelProviderCapabilitiesRead: "modelProvider/capabilities/read",
   reviewStart: "review/start",
+  accountRead: "account/read",
+  permissionRespond: "permission/respond",
+  hookRespond: "hook/respond",
+  agentDefine: "agent/define",
+  agentList: "agent/list",
+  agentRemove: "agent/remove",
+  mcpServerSet: "mcpServer/set",
+  threadModelSet: "thread/model/set",
+  threadMaxThinkingTokensSet: "thread/maxThinkingTokens/set",
 } as const;
 
 export const Notifications = {
@@ -389,6 +398,19 @@ export const Notifications = {
   threadMetadataUpdated: "thread/metadata/updated",
   threadSettingsUpdated: "thread/settings/updated",
   threadMemoryModeChanged: "thread/memoryMode/changed",
+  threadSessionInit: "thread/session/init",
+  itemReasoningTextDelta: "item/reasoning/textDelta",
+  threadTokenUsageUpdated: "thread/tokenUsage/updated",
+  threadCompacted: "thread/compacted",
+  modelRerouted: "model/rerouted",
+  hookStarted: "hook/started",
+  hookCompleted: "hook/completed",
+  itemCommandExecutionRequestApproval: "item/commandExecution/requestApproval",
+  itemFileChangeRequestApproval: "item/fileChange/requestApproval",
+  itemPermissionsRequestApproval: "item/permissions/requestApproval",
+  itemToolRequestUserInput: "item/tool/requestUserInput",
+  mcpServerElicitationRequest: "mcpServer/elicitation/request",
+  accountUpdated: "account/updated",
 } as const;
 "#;
 
