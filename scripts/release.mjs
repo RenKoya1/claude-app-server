@@ -78,11 +78,12 @@ function readPkg() {
 }
 
 function parseArgs(argv) {
-  const args = { bump: "patch", local: false, dryRun: false };
+  const args = { bump: "patch", local: false, dryRun: false, skipSmoke: false };
   for (const arg of argv) {
     if (arg === "patch" || arg === "minor" || arg === "major") args.bump = arg;
     else if (arg === "--local") args.local = true;
     else if (arg === "--dry-run") args.dryRun = true;
+    else if (arg === "--skip-smoke") args.skipSmoke = true;
     else if (arg === "--help" || arg === "-h") {
       console.log(readFileSync(import.meta.url ? fileURLToPath(import.meta.url) : "release.mjs", "utf8").split("\n").slice(0, 30).join("\n"));
       process.exit(0);
@@ -95,6 +96,82 @@ function parseArgs(argv) {
   return args;
 }
 
+function ensureSmokeTestPasses() {
+  console.log("release: building local artifacts (cargo + tsc + stage)");
+  run("./scripts/build-local.sh", []);
+
+  console.log("release: running smoke test against freshly-built launcher");
+  const smokeInput = [
+    '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"release-smoke","version":"0.0.0"}}}',
+    '{"method":"initialized","params":{}}',
+    '{"id":2,"method":"config/read"}',
+    '{"id":3,"method":"fs/createDirectory","params":{"path":"/tmp/cas_release_smoke"}}',
+    '{"id":4,"method":"fs/writeFile","params":{"path":"/tmp/cas_release_smoke/x","dataBase64":"b2s="}}',
+    '{"id":5,"method":"fs/readFile","params":{"path":"/tmp/cas_release_smoke/x"}}',
+    '{"id":6,"method":"command/exec","params":{"command":["echo","ok"]}}',
+    '{"id":7,"method":"thread/start","params":{"model":"claude-haiku-4-5-20251001"}}',
+    '{"id":8,"method":"thread/loaded/list"}',
+    '{"id":9,"method":"fs/remove","params":{"path":"/tmp/cas_release_smoke"}}',
+    "",
+  ].join("\n");
+
+  const r = spawnSync("node", ["bin/launcher.mjs"], {
+    cwd: PKG_ROOT,
+    input: smokeInput,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (r.status !== 0) {
+    bail(`smoke test launcher exited with ${r.status}\nstderr:\n${r.stderr}`);
+  }
+  const errCount = (r.stdout.match(/"error":\s*{/g) ?? []).length;
+  if (errCount > 0) {
+    bail(`smoke test produced ${errCount} JSON-RPC error response(s):\n${r.stdout}`);
+  }
+  for (const id of [1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+    if (!r.stdout.includes(`"id":${id},"result"`)) {
+      bail(`smoke test missing response for id=${id}:\n${r.stdout}`);
+    }
+  }
+  console.log("release: smoke test passed (9/9 ids responded with result)");
+}
+
+function ensurePackageSize() {
+  console.log("release: checking npm pack size budget");
+  const r = spawnSync(
+    "npm",
+    ["pack", "--dry-run", "--json"],
+    { cwd: PKG_ROOT, encoding: "utf8", env: { ...process.env, CLAUDE_APP_SERVER_SKIP_DOWNLOAD: "1" } },
+  );
+  if (r.status !== 0) {
+    bail(`npm pack --dry-run failed:\n${r.stderr}`);
+  }
+  let pack;
+  try {
+    const arr = JSON.parse(r.stdout);
+    pack = Array.isArray(arr) ? arr[0] : arr;
+  } catch (e) {
+    bail(`could not parse npm pack output: ${e.message}\n${r.stdout}`);
+  }
+  const tarballBytes = pack.size ?? 0;
+  const unpackedBytes = pack.unpackedSize ?? 0;
+  const TARBALL_CAP = 15 * 1024 * 1024;
+  const UNPACKED_CAP = 85 * 1024 * 1024;
+  console.log(
+    `release: package size ${(tarballBytes / 1024 / 1024).toFixed(1)} MB tarball, ${(unpackedBytes / 1024 / 1024).toFixed(1)} MB unpacked`,
+  );
+  if (tarballBytes > TARBALL_CAP) {
+    bail(
+      `tarball size ${(tarballBytes / 1024 / 1024).toFixed(1)} MB exceeds cap ${(TARBALL_CAP / 1024 / 1024).toFixed(0)} MB`,
+    );
+  }
+  if (unpackedBytes > UNPACKED_CAP) {
+    bail(
+      `unpacked size ${(unpackedBytes / 1024 / 1024).toFixed(1)} MB exceeds cap ${(UNPACKED_CAP / 1024 / 1024).toFixed(0)} MB`,
+    );
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const pkg = readPkg();
@@ -105,6 +182,16 @@ async function main() {
   ensureCleanGit();
   const branch = currentBranch();
   console.log(`release: on branch ${branch}`);
+
+  // CLAUDE.md hard rule: never publish without smoke test + size check.
+  // Both gates can be disabled with --skip-smoke for emergency hotfixes
+  // (but think twice before doing that).
+  if (!args.skipSmoke) {
+    ensureSmokeTestPasses();
+    ensurePackageSize();
+  } else {
+    console.warn("release: --skip-smoke set; CLAUDE.md hard rule bypassed (use only for hotfixes).");
+  }
 
   if (args.local) {
     ensureNpmAuthForLocalPublish();
