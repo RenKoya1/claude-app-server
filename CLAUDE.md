@@ -31,9 +31,10 @@ passed against the current working tree:**
    ```bash
    npm pack --dry-run 2>&1 | grep -E "package size|unpacked size"
    ```
-   Budget: **tarball ≤ 40 MB**, **unpacked ≤ 100 MB**. The floor is set
-   by the Claude Agent SDK's per-platform ripgrep vendor binaries
-   (~40 MB across darwin x2 + linux x2). If exceeded, investigate —
+   Budget: **tarball ≤ 80 MB**, **unpacked ≤ 260 MB**. The floor is
+   set by the Claude Agent SDK 0.3+ runtime (`@anthropic-ai/sdk`, MCP
+   runtime, Hono, per-platform `claude-agent-sdk-*` binary, and the
+   per-platform ripgrep vendor binaries). If exceeded, investigate —
    likely a regression in `npm prune --omit=dev` or the win32 ripgrep
    strip.
 6. **Git working tree is clean** and on `main`. No

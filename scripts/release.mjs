@@ -158,8 +158,11 @@ function ensurePackageSize() {
   // Floor is set by the Claude Agent SDK's per-platform ripgrep vendor
   // binaries (~40 MB across darwin x2 + linux x2). The user-side
   // postinstall prunes 3 of 4 to bring on-disk size to ~50 MB.
-  const TARBALL_CAP = 40 * 1024 * 1024;
-  const UNPACKED_CAP = 100 * 1024 * 1024;
+  // SDK 0.3+ pulled in @anthropic-ai/sdk + MCP runtime + Hono, plus a
+  // pre-built platform binary (`claude-agent-sdk-darwin-arm64` etc.).
+  // The floor moved from ~30 MB to ~65 MB compressed.
+  const TARBALL_CAP = 80 * 1024 * 1024;
+  const UNPACKED_CAP = 260 * 1024 * 1024;
   console.log(
     `release: package size ${(tarballBytes / 1024 / 1024).toFixed(1)} MB tarball, ${(unpackedBytes / 1024 / 1024).toFixed(1)} MB unpacked`,
   );
