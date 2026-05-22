@@ -42,8 +42,27 @@ type InboundCommand =
       options?: SessionOptions;
     }
   | { id: string; type: "turn"; sessionId: string; turnId: string; input: TurnInput[] }
+  | { id: string; type: "steerTurn"; sessionId: string; turnId: string; input: TurnInput[] }
+  | {
+      id: string;
+      type: "injectItems";
+      sessionId: string;
+      items: unknown[];
+    }
   | { id: string; type: "interrupt"; sessionId: string; turnId: string }
+  | { id: string; type: "compact"; sessionId: string }
   | { id: string; type: "closeSession"; sessionId: string }
+  | { id: string; type: "listSkills"; cwds?: string[] }
+  | { id: string; type: "listHooks"; cwds?: string[] }
+  | { id: string; type: "listMcpServers"; sessionId?: string }
+  | {
+      id: string;
+      type: "callMcpTool";
+      sessionId?: string;
+      server: string;
+      tool: string;
+      arguments?: Record<string, unknown>;
+    }
   | { id: string; type: "shutdown" };
 
 type TurnInput =
@@ -54,6 +73,13 @@ type TurnInput =
 type OutboundEvent =
   | { type: "ack"; id: string; ok: true }
   | { type: "ack"; id: string; ok: false; error: string }
+  // Acks that carry a result payload for query-style commands.
+  | {
+      type: "result";
+      id: string;
+      ok: true;
+      payload: unknown;
+    }
   | { type: "ready" }
   | { type: "log"; level: "info" | "warn" | "error"; msg: string }
   | { type: "sessionReady"; sessionId: string }
@@ -409,6 +435,48 @@ function handleCommand(cmd: InboundCommand): void {
       emit({ type: "turnStarted", sessionId: cmd.sessionId, turnId: cmd.turnId });
       return;
     }
+    case "steerTurn": {
+      const session = sessions.get(cmd.sessionId);
+      if (!session) {
+        emit({ type: "ack", id: cmd.id, ok: false, error: "no such session" });
+        return;
+      }
+      if (!session.activeTurnId || session.activeTurnId !== cmd.turnId) {
+        emit({
+          type: "ack",
+          id: cmd.id,
+          ok: false,
+          error: `no matching active turn (have ${session.activeTurnId ?? "none"})`,
+        });
+        return;
+      }
+      const steerMessage: SDKUserMessage = {
+        type: "user",
+        message: { role: "user", content: inputToBlocks(cmd.input) },
+        parent_tool_use_id: null,
+        session_id: session.sdkSessionId ?? session.sessionId,
+      };
+      session.input.push(steerMessage);
+      emit({ type: "ack", id: cmd.id, ok: true });
+      return;
+    }
+    case "injectItems": {
+      const session = sessions.get(cmd.sessionId);
+      if (!session) {
+        emit({ type: "ack", id: cmd.id, ok: false, error: "no such session" });
+        return;
+      }
+      // The SDK does not currently expose a "inject raw items" API on
+      // streaming sessions; we ack so clients have parity surface, but the
+      // items only land if they parse as a valid SDK user message.
+      for (const raw of cmd.items) {
+        if (raw && typeof raw === "object") {
+          session.input.push(raw as SDKUserMessage);
+        }
+      }
+      emit({ type: "ack", id: cmd.id, ok: true });
+      return;
+    }
     case "interrupt": {
       const session = sessions.get(cmd.sessionId);
       if (!session) {
@@ -416,6 +484,31 @@ function handleCommand(cmd: InboundCommand): void {
         return;
       }
       session.abort.abort();
+      // Replace the aborted controller so the next `turn` can run without
+      // having to recreate the whole session.
+      session.abort = new AbortController();
+      emit({ type: "ack", id: cmd.id, ok: true });
+      return;
+    }
+    case "compact": {
+      const session = sessions.get(cmd.sessionId);
+      if (!session) {
+        emit({ type: "ack", id: cmd.id, ok: false, error: "no such session" });
+        return;
+      }
+      // SDK exposes context compaction via /compact slash command in the
+      // chat history. We approximate by pushing a user message that the
+      // SDK will interpret as a compaction trigger.
+      const trigger: SDKUserMessage = {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "/compact" }],
+        },
+        parent_tool_use_id: null,
+        session_id: session.sdkSessionId ?? session.sessionId,
+      };
+      session.input.push(trigger);
       emit({ type: "ack", id: cmd.id, ok: true });
       return;
     }
@@ -428,6 +521,61 @@ function handleCommand(cmd: InboundCommand): void {
       session.input.close();
       session.abort.abort();
       emit({ type: "ack", id: cmd.id, ok: true });
+      return;
+    }
+    case "listSkills": {
+      // Best-effort enumeration: scan ~/.claude/skills/ and per-cwd
+      // .claude/skills/ for SKILL.md files. The SDK loads skills at turn
+      // time, so this only exposes their existence on disk.
+      const fs = require("node:fs") as typeof import("node:fs");
+      const path = require("node:path") as typeof import("node:path");
+      const cwds = cmd.cwds ?? [];
+      const homes = [process.env.CLAUDE_HOME ?? path.join(process.env.HOME ?? "", ".claude")];
+      const data: Array<{ name: string; path: string; description?: string; cwd?: string }> = [];
+      for (const root of [...homes, ...cwds.map((c) => path.join(c, ".claude"))]) {
+        const skillsDir = path.join(root, "skills");
+        if (!fs.existsSync(skillsDir)) continue;
+        let entries: string[];
+        try { entries = fs.readdirSync(skillsDir); } catch { continue; }
+        for (const entry of entries) {
+          const skillPath = path.join(skillsDir, entry, "SKILL.md");
+          if (!fs.existsSync(skillPath)) continue;
+          let description: string | undefined;
+          try {
+            const text = fs.readFileSync(skillPath, "utf8");
+            const match = /^description:\s*(.+)$/m.exec(text);
+            if (match) description = match[1].trim();
+          } catch {}
+          data.push({ name: entry, path: skillPath, description });
+        }
+      }
+      emit({ type: "result", id: cmd.id, ok: true, payload: { data } });
+      return;
+    }
+    case "listHooks": {
+      // SDK uses programmatic hooks via Options.hooks at session creation;
+      // there is no global discovery API. We surface an empty list rather
+      // than fabricate one, matching codex contract for hooks/list.
+      emit({ type: "result", id: cmd.id, ok: true, payload: { data: [] } });
+      return;
+    }
+    case "listMcpServers": {
+      // The SDK does not expose MCP server status via a stable API surface
+      // in the current version. We return an empty list as a placeholder so
+      // clients can call the endpoint without erroring; richer support
+      // lands when the SDK exposes McpServerStatus.
+      emit({ type: "result", id: cmd.id, ok: true, payload: { data: [] } });
+      return;
+    }
+    case "callMcpTool": {
+      // Same reason as above: MCP tool invocation goes through the agent
+      // loop normally. We do not surface a separate call API yet.
+      emit({
+        type: "ack",
+        id: cmd.id,
+        ok: false,
+        error: "mcpServer/tool/call: not supported yet (route tool calls through turn/start)",
+      });
       return;
     }
     case "shutdown": {

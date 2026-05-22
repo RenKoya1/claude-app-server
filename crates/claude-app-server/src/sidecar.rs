@@ -50,9 +50,44 @@ enum OutboundCommand {
         input: Vec<TurnInput>,
     },
     #[serde(rename_all = "camelCase")]
+    SteerTurn {
+        id: String,
+        session_id: String,
+        turn_id: String,
+        input: Vec<TurnInput>,
+    },
+    #[serde(rename_all = "camelCase")]
+    InjectItems {
+        id: String,
+        session_id: String,
+        items: Vec<Value>,
+    },
+    #[serde(rename_all = "camelCase")]
     Interrupt { id: String, session_id: String, turn_id: String },
     #[serde(rename_all = "camelCase")]
+    Compact { id: String, session_id: String },
+    #[serde(rename_all = "camelCase")]
     CloseSession { id: String, session_id: String },
+    #[serde(rename_all = "camelCase")]
+    ListSkills { id: String, #[serde(skip_serializing_if = "Vec::is_empty")] cwds: Vec<String> },
+    #[serde(rename_all = "camelCase")]
+    ListHooks { id: String, #[serde(skip_serializing_if = "Vec::is_empty")] cwds: Vec<String> },
+    #[serde(rename_all = "camelCase")]
+    ListMcpServers {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    CallMcpTool {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        server: String,
+        tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments: Option<Value>,
+    },
     Shutdown { id: String },
 }
 
@@ -108,6 +143,9 @@ impl From<InputChunk> for TurnInput {
 pub enum SidecarEvent {
     #[serde(rename_all = "camelCase")]
     Ack { id: String, ok: bool, #[serde(default)] error: Option<String> },
+    /// Like `Ack { ok: true }` but carries a JSON payload for query-style commands.
+    #[serde(rename_all = "camelCase")]
+    Result { id: String, payload: Value },
     Ready,
     #[serde(rename_all = "camelCase")]
     Log { level: String, msg: String },
@@ -167,7 +205,11 @@ struct Inner {
 }
 
 #[derive(Debug)]
-struct AckResult { ok: bool, error: Option<String> }
+struct AckResult {
+    ok: bool,
+    error: Option<String>,
+    payload: Option<Value>,
+}
 
 impl SidecarClient {
     /// Spawn the sidecar. Resolution order for the executable:
@@ -216,7 +258,17 @@ impl SidecarClient {
                                 Ok(SidecarEvent::Ack { id, ok, error }) => {
                                     let mut guard = pending.lock().await;
                                     if let Some(tx) = guard.remove(&id) {
-                                        let _ = tx.send(AckResult { ok, error });
+                                        let _ = tx.send(AckResult { ok, error, payload: None });
+                                    }
+                                }
+                                Ok(SidecarEvent::Result { id, payload }) => {
+                                    let mut guard = pending.lock().await;
+                                    if let Some(tx) = guard.remove(&id) {
+                                        let _ = tx.send(AckResult {
+                                            ok: true,
+                                            error: None,
+                                            payload: Some(payload),
+                                        });
                                     }
                                 }
                                 Ok(SidecarEvent::Log { level, msg }) => {
@@ -318,14 +370,15 @@ impl SidecarClient {
     }
 
     async fn dispatch(&self, command: OutboundCommand) -> anyhow::Result<()> {
-        let id = match &command {
-            OutboundCommand::CreateSession { id, .. }
-            | OutboundCommand::Turn { id, .. }
-            | OutboundCommand::Interrupt { id, .. }
-            | OutboundCommand::CloseSession { id, .. }
-            | OutboundCommand::Shutdown { id } => id.clone(),
-        };
+        let _ = self.dispatch_with_payload(command).await?;
+        Ok(())
+    }
 
+    async fn dispatch_with_payload(
+        &self,
+        command: OutboundCommand,
+    ) -> anyhow::Result<Option<Value>> {
+        let id = command_id(&command);
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.inner.pending.lock().await;
@@ -343,7 +396,7 @@ impl SidecarClient {
         if !ack.ok {
             bail!("sidecar rejected command id={id}: {}", ack.error.unwrap_or_default());
         }
-        Ok(())
+        Ok(ack.payload)
     }
 
     pub async fn create_session(
@@ -398,6 +451,109 @@ impl SidecarClient {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let id = self.next_id().await;
         self.dispatch(OutboundCommand::Shutdown { id }).await
+    }
+
+    pub async fn steer_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        input: Vec<TurnInput>,
+    ) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::SteerTurn {
+            id,
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            input,
+        })
+        .await
+    }
+
+    pub async fn inject_items(
+        &self,
+        session_id: &str,
+        items: Vec<Value>,
+    ) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::InjectItems {
+            id,
+            session_id: session_id.to_string(),
+            items,
+        })
+        .await
+    }
+
+    pub async fn compact(&self, session_id: &str) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::Compact {
+            id,
+            session_id: session_id.to_string(),
+        })
+        .await
+    }
+
+    pub async fn list_skills(&self, cwds: Vec<String>) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::ListSkills { id, cwds })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn list_hooks(&self, cwds: Vec<String>) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::ListHooks { id, cwds })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn list_mcp_servers(
+        &self,
+        session_id: Option<String>,
+    ) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::ListMcpServers { id, session_id })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn call_mcp_tool(
+        &self,
+        session_id: Option<String>,
+        server: String,
+        tool: String,
+        arguments: Option<Value>,
+    ) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::CallMcpTool {
+                id,
+                session_id,
+                server,
+                tool,
+                arguments,
+            })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+}
+
+fn command_id(c: &OutboundCommand) -> String {
+    match c {
+        OutboundCommand::CreateSession { id, .. }
+        | OutboundCommand::Turn { id, .. }
+        | OutboundCommand::SteerTurn { id, .. }
+        | OutboundCommand::InjectItems { id, .. }
+        | OutboundCommand::Interrupt { id, .. }
+        | OutboundCommand::Compact { id, .. }
+        | OutboundCommand::CloseSession { id, .. }
+        | OutboundCommand::ListSkills { id, .. }
+        | OutboundCommand::ListHooks { id, .. }
+        | OutboundCommand::ListMcpServers { id, .. }
+        | OutboundCommand::CallMcpTool { id, .. }
+        | OutboundCommand::Shutdown { id } => id.clone(),
     }
 }
 

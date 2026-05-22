@@ -1,9 +1,11 @@
 //! JSON-RPC dispatcher. Mirrors codex `MessageProcessor`. All model-loop work
 //! is delegated to the TypeScript sidecar via `SidecarClient`.
 
+use crate::exec::ExecRegistry;
+use crate::fs::{self as fs_ops, FsWatchRegistry};
 use crate::outgoing::OutgoingSender;
 use crate::sidecar::{SidecarClient, SidecarEvent, SidecarSessionOptions, TurnInput};
-use crate::thread_store::ThreadStore;
+use crate::thread_store::{ThreadStore, UnsubscribeStatus};
 use claude_app_server_protocol as proto;
 use proto::{
     ItemAgentMessageDeltaEvent, ItemCompletedEvent, ItemStartedEvent, JsonRpcMessage,
@@ -26,6 +28,8 @@ pub struct MessageProcessor {
     /// Sidecar sessions we've created. We lazily create one the first time a
     /// thread runs a turn, and reuse it for the thread's lifetime.
     created_sessions: Arc<Mutex<HashSet<String>>>,
+    fs_watches: FsWatchRegistry,
+    exec_registry: ExecRegistry,
 }
 
 impl MessageProcessor {
@@ -37,6 +41,8 @@ impl MessageProcessor {
             initialized: Arc::new(Mutex::new(false)),
             default_model,
             created_sessions: Arc::new(Mutex::new(HashSet::new())),
+            fs_watches: FsWatchRegistry::new(),
+            exec_registry: ExecRegistry::new(),
         }
     }
 
@@ -68,16 +74,61 @@ impl MessageProcessor {
         let params = req.params.clone().unwrap_or(serde_json::Value::Null);
 
         match method {
+            // Lifecycle
             proto::request::INITIALIZE => self.handle_initialize(id, params).await,
+
+            // Threads
             proto::request::THREAD_START => self.handle_thread_start(id, params).await,
             proto::request::THREAD_RESUME => self.handle_thread_resume(id, params).await,
             proto::request::THREAD_FORK => self.handle_thread_fork(id, params).await,
             proto::request::THREAD_LIST => self.handle_thread_list(id, params).await,
+            proto::request::THREAD_LOADED_LIST => self.handle_thread_loaded_list(id).await,
             proto::request::THREAD_READ => self.handle_thread_read(id, params).await,
             proto::request::THREAD_ARCHIVE => self.handle_thread_archive(id, params).await,
+            proto::request::THREAD_UNARCHIVE => self.handle_thread_unarchive(id, params).await,
+            proto::request::THREAD_UNSUBSCRIBE => self.handle_thread_unsubscribe(id, params).await,
+            proto::request::THREAD_NAME_SET => self.handle_thread_name_set(id, params).await,
+            proto::request::THREAD_INJECT_ITEMS => self.handle_thread_inject_items(id, params).await,
+            proto::request::THREAD_COMPACT_START => self.handle_thread_compact(id, params).await,
+            proto::request::THREAD_GOAL_SET => self.handle_goal_set(id, params).await,
+            proto::request::THREAD_GOAL_GET => self.handle_goal_get(id, params).await,
+            proto::request::THREAD_GOAL_CLEAR => self.handle_goal_clear(id, params).await,
+
+            // Turns
             proto::request::TURN_START => self.handle_turn_start(id, params).await,
             proto::request::TURN_INTERRUPT => self.handle_turn_interrupt(id, params).await,
+            proto::request::TURN_STEER => self.handle_turn_steer(id, params).await,
+
+            // Models / config
             proto::request::MODEL_LIST => self.handle_model_list(id).await,
+            proto::request::CONFIG_READ => self.handle_config_read(id).await,
+
+            // Skills / hooks
+            proto::request::SKILLS_LIST => self.handle_skills_list(id, params).await,
+            proto::request::HOOKS_LIST => self.handle_hooks_list(id, params).await,
+
+            // MCP
+            proto::request::MCP_SERVER_STATUS_LIST => self.handle_mcp_status_list(id).await,
+            proto::request::MCP_SERVER_TOOL_CALL => self.handle_mcp_tool_call(id, params).await,
+
+            // Filesystem
+            proto::request::FS_READ_FILE => self.handle_fs_read_file(id, params).await,
+            proto::request::FS_WRITE_FILE => self.handle_fs_write_file(id, params).await,
+            proto::request::FS_CREATE_DIRECTORY => self.handle_fs_create_dir(id, params).await,
+            proto::request::FS_GET_METADATA => self.handle_fs_metadata(id, params).await,
+            proto::request::FS_READ_DIRECTORY => self.handle_fs_read_dir(id, params).await,
+            proto::request::FS_REMOVE => self.handle_fs_remove(id, params).await,
+            proto::request::FS_COPY => self.handle_fs_copy(id, params).await,
+            proto::request::FS_WATCH => self.handle_fs_watch(id, params).await,
+            proto::request::FS_UNWATCH => self.handle_fs_unwatch(id, params).await,
+
+            // Command exec
+            proto::request::COMMAND_EXEC => self.handle_command_exec(id, params).await,
+            proto::request::COMMAND_EXEC_WRITE => self.handle_command_exec_write(id, params).await,
+            proto::request::COMMAND_EXEC_TERMINATE => {
+                self.handle_command_exec_terminate(id, params).await
+            }
+
             other => {
                 self.out
                     .error(
@@ -217,8 +268,11 @@ impl MessageProcessor {
                 warn!("could not close sidecar session for {}: {e}", p.thread_id);
             }
         }
-        let _ = self.store.archive(&p.thread_id).await;
+        let archived = self.store.archive(&p.thread_id).await;
         self.out.respond_empty(id).await;
+        if archived.is_some() {
+            self.handle_thread_archive_emit(&p.thread_id).await;
+        }
     }
 
     async fn handle_model_list(&self, id: proto::RequestId) {
@@ -498,6 +552,403 @@ impl MessageProcessor {
                 thread_id: thread_id.to_string(),
                 status: ThreadStatus::Idle,
             })
+            .await;
+    }
+
+    // --- New endpoints (v0.2.0) ----------------------------------------
+
+    async fn handle_thread_loaded_list(&self, id: proto::RequestId) {
+        let data = self.store.list_loaded_ids().await;
+        self.out
+            .respond(id, &proto::ThreadLoadedListResult { data })
+            .await;
+    }
+
+    async fn handle_thread_unsubscribe(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadUnsubscribeParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let status = self.store.unsubscribe(&p.thread_id).await;
+        self.out
+            .respond(
+                id,
+                &proto::ThreadUnsubscribeResult {
+                    status: status.as_str().to_string(),
+                },
+            )
+            .await;
+        if matches!(status, UnsubscribeStatus::Unsubscribed) {
+            // Best-effort: tell the sidecar to drop the session.
+            if let Err(e) = self.sidecar.close_session(&p.thread_id).await {
+                warn!("sidecar close_session failed: {e}");
+            }
+            self.created_sessions.lock().await.remove(&p.thread_id);
+            self.out
+                .notify(
+                    proto::notification::THREAD_CLOSED,
+                    &serde_json::json!({ "threadId": p.thread_id }),
+                )
+                .await;
+        }
+    }
+
+    async fn handle_thread_unarchive(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadArchiveParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(thread) = self.store.unarchive(&p.thread_id).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Archived thread not found").await;
+            return;
+        };
+        self.out
+            .respond(id, &serde_json::json!({ "thread": thread }))
+            .await;
+        self.out
+            .notify(
+                proto::notification::THREAD_UNARCHIVED,
+                &serde_json::json!({ "threadId": p.thread_id }),
+            )
+            .await;
+    }
+
+    async fn handle_thread_name_set(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadNameSetParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        if self.store.set_name(&p.thread_id, p.name.clone()).await.is_none() {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        }
+        self.out.respond_empty(id).await;
+        self.out
+            .notify(
+                proto::notification::THREAD_NAME_UPDATED,
+                &serde_json::json!({ "threadId": p.thread_id, "name": p.name }),
+            )
+            .await;
+    }
+
+    async fn handle_thread_inject_items(
+        self: Arc<Self>,
+        id: proto::RequestId,
+        params: serde_json::Value,
+    ) {
+        let p: proto::ThreadInjectItemsParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        if !self.created_sessions.lock().await.contains(&p.thread_id) {
+            self.out
+                .error(id, proto::INTERNAL_ERROR, "thread has no active sidecar session")
+                .await;
+            return;
+        }
+        if let Err(e) = self.sidecar.inject_items(&p.thread_id, p.items).await {
+            self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await;
+            return;
+        }
+        self.out.respond_empty(id).await;
+    }
+
+    async fn handle_thread_compact(
+        self: Arc<Self>,
+        id: proto::RequestId,
+        params: serde_json::Value,
+    ) {
+        let p: proto::ThreadCompactStartParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        if !self.created_sessions.lock().await.contains(&p.thread_id) {
+            self.out
+                .error(id, proto::INTERNAL_ERROR, "thread has no active sidecar session")
+                .await;
+            return;
+        }
+        if let Err(e) = self.sidecar.compact(&p.thread_id).await {
+            self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await;
+            return;
+        }
+        self.out.respond_empty(id).await;
+    }
+
+    async fn handle_goal_set(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadGoalSetParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let goal = self
+            .store
+            .set_goal(&p.thread_id, p.objective, p.status, p.token_budget)
+            .await;
+        let Some(goal) = goal else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        self.out
+            .respond(id, &proto::ThreadGoalResult { goal: Some(goal.clone()) })
+            .await;
+        self.out
+            .notify(
+                proto::notification::THREAD_GOAL_UPDATED,
+                &serde_json::json!({ "threadId": p.thread_id, "goal": goal }),
+            )
+            .await;
+    }
+
+    async fn handle_goal_get(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadGoalGetParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let goal = self.store.get_goal(&p.thread_id).await;
+        self.out.respond(id, &proto::ThreadGoalResult { goal }).await;
+    }
+
+    async fn handle_goal_clear(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadGoalClearParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let cleared = self.store.clear_goal(&p.thread_id).await;
+        self.out
+            .respond(id, &proto::ThreadGoalClearResult { cleared })
+            .await;
+        if cleared {
+            self.out
+                .notify(
+                    proto::notification::THREAD_GOAL_CLEARED,
+                    &serde_json::json!({ "threadId": p.thread_id }),
+                )
+                .await;
+        }
+    }
+
+    async fn handle_turn_steer(
+        self: Arc<Self>,
+        id: proto::RequestId,
+        params: serde_json::Value,
+    ) {
+        let p: proto::TurnSteerParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let inputs: Vec<TurnInput> = p.input.into_iter().map(Into::into).collect();
+        if let Err(e) = self.sidecar.steer_turn(&p.thread_id, &p.expected_turn_id, inputs).await {
+            self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await;
+            return;
+        }
+        self.out
+            .respond(
+                id,
+                &proto::TurnSteerResult { turn_id: p.expected_turn_id },
+            )
+            .await;
+    }
+
+    async fn handle_config_read(&self, id: proto::RequestId) {
+        let claude_home = std::env::var("CLAUDE_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.claude")))
+            .unwrap_or_else(|_| ".claude".into());
+        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
+        let result = proto::ConfigReadResult {
+            model: self.default_model.clone(),
+            claude_home,
+            platform_family: std::env::consts::FAMILY.into(),
+            platform_os: std::env::consts::OS.into(),
+            cwd,
+        };
+        self.out.respond(id, &result).await;
+    }
+
+    async fn handle_skills_list(self: Arc<Self>, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::SkillsListParams = serde_json::from_value(params).unwrap_or_default();
+        match self.sidecar.list_skills(p.cwds).await {
+            Ok(value) => self.out.raw_response(id, value).await,
+            Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+        }
+    }
+
+    async fn handle_hooks_list(self: Arc<Self>, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::HooksListParams = serde_json::from_value(params).unwrap_or_default();
+        match self.sidecar.list_hooks(p.cwds).await {
+            Ok(value) => self.out.raw_response(id, value).await,
+            Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+        }
+    }
+
+    async fn handle_mcp_status_list(self: Arc<Self>, id: proto::RequestId) {
+        match self.sidecar.list_mcp_servers(None).await {
+            Ok(value) => self.out.raw_response(id, value).await,
+            Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+        }
+    }
+
+    async fn handle_mcp_tool_call(
+        self: Arc<Self>,
+        id: proto::RequestId,
+        params: serde_json::Value,
+    ) {
+        let p: proto::McpServerToolCallParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match self
+            .sidecar
+            .call_mcp_tool(p.thread_id, p.server, p.tool, p.arguments)
+            .await
+        {
+            Ok(value) => self.out.raw_response(id, value).await,
+            Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+        }
+    }
+
+    // --- Filesystem ----------------------------------------------------
+
+    async fn handle_fs_read_file(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsReadFileParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match fs_ops::read_file(p) {
+            Ok(r) => self.out.respond(id, &r).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_write_file(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsWriteFileParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match fs_ops::write_file(p) {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_create_dir(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsCreateDirectoryParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match fs_ops::create_directory(p) {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_metadata(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsMetadataParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match fs_ops::get_metadata(p) {
+            Ok(r) => self.out.respond(id, &r).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_read_dir(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsReadDirectoryParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match fs_ops::read_directory(p) {
+            Ok(r) => self.out.respond(id, &r).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_remove(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsRemoveParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match fs_ops::remove(p) {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_copy(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsCopyParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match fs_ops::copy(p) {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_watch(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsWatchParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match self.fs_watches.watch(p, self.out.clone()).await {
+            Ok(r) => self.out.respond(id, &r).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_fs_unwatch(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::FsUnwatchParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match self.fs_watches.unwatch(p).await {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    // --- Command exec --------------------------------------------------
+
+    async fn handle_command_exec(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::CommandExecParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match self.exec_registry.run(p, self.out.clone()).await {
+            Ok(r) => self.out.respond(id, &r).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_command_exec_write(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::CommandExecWriteParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match self.exec_registry.write(p).await {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_command_exec_terminate(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::CommandExecTerminateParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match self.exec_registry.terminate(p).await {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, e.error_code(), format!("{e}")).await,
+        }
+    }
+
+    async fn handle_thread_archive_emit(&self, thread_id: &str) {
+        // Emit `thread/archived` (codex parity) after a successful archive.
+        self.out
+            .notify(
+                proto::notification::THREAD_ARCHIVED,
+                &serde_json::json!({ "threadId": thread_id }),
+            )
             .await;
     }
 }
