@@ -155,8 +155,11 @@ function ensurePackageSize() {
   }
   const tarballBytes = pack.size ?? 0;
   const unpackedBytes = pack.unpackedSize ?? 0;
-  const TARBALL_CAP = 15 * 1024 * 1024;
-  const UNPACKED_CAP = 85 * 1024 * 1024;
+  // Floor is set by the Claude Agent SDK's per-platform ripgrep vendor
+  // binaries (~40 MB across darwin x2 + linux x2). The user-side
+  // postinstall prunes 3 of 4 to bring on-disk size to ~50 MB.
+  const TARBALL_CAP = 40 * 1024 * 1024;
+  const UNPACKED_CAP = 100 * 1024 * 1024;
   console.log(
     `release: package size ${(tarballBytes / 1024 / 1024).toFixed(1)} MB tarball, ${(unpackedBytes / 1024 / 1024).toFixed(1)} MB unpacked`,
   );

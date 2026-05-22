@@ -2,5 +2,8 @@ pub mod exec;
 pub mod fs;
 pub mod outgoing;
 pub mod processor;
+pub mod rollouts;
+pub mod schema_export;
 pub mod sidecar;
 pub mod thread_store;
+pub mod ws_transport;

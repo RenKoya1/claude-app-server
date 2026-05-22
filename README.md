@@ -308,8 +308,18 @@ initialize handshake before sending other requests.)
   environments without outbound HTTP need `CLAUDE_APP_SERVER_RELEASE_URL`
   pointing at a mirror or `npm run build` from a source checkout.
 
-## Contributing / releasing
+## Contributing
 
-Maintainer-only release notes live in [`RELEASING.md`](RELEASING.md).
-Contributor build instructions are in the *Build from source* section
-above.
+We welcome PRs. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before
+opening one.
+
+**Releases are restricted to maintainers.** Only repository maintainers
+with push access to `RenKoya1/claude-app-server` (and the `NPM_TOKEN`
+secret on this GitHub repo) can publish to npm. Contributors should:
+
+- Fork the repo on GitHub.
+- Push a feature branch to your fork.
+- Open a PR against `RenKoya1/claude-app-server:main`.
+
+A maintainer will review, merge, and cut the next release (see
+[`RELEASING.md`](RELEASING.md) for the procedure they follow).

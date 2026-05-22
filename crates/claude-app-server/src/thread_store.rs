@@ -1,7 +1,8 @@
-//! In-memory thread + goal + archive store. Codex persists to sqlite + JSONL
-//! rollouts; this MVP keeps everything in RAM and is reset per process.
-//! Persistence is a future task.
+//! Thread + goal + archive state. Backed by an in-memory hash map for hot
+//! access and (optionally) by `RolloutStore` for JSONL persistence so the
+//! server survives restarts the same way `codex app-server` does.
 
+use crate::rollouts::{RolloutEvent, RolloutStore};
 use chrono::Utc;
 use claude_app_server_protocol::{
     InputChunk, Item, Thread, ThreadGoal, ThreadStatus, Turn, TurnStatus,
@@ -26,6 +27,7 @@ pub struct StoredThread {
 #[derive(Clone, Default)]
 pub struct ThreadStore {
     inner: Arc<Mutex<Inner>>,
+    rollouts: Option<RolloutStore>,
 }
 
 #[derive(Default)]
@@ -36,6 +38,45 @@ struct Inner {
 
 impl ThreadStore {
     pub fn new() -> Self { Self::default() }
+
+    pub fn with_rollouts(rollouts: RolloutStore) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            rollouts: Some(rollouts),
+        }
+    }
+
+    /// Rebuild in-memory state from rollout files. Call once at startup
+    /// after constructing the store. Threads come back in `notLoaded`
+    /// status; the first `thread/resume` will lift them to `idle`.
+    pub async fn replay_rollouts(&self) {
+        let Some(rollouts) = &self.rollouts else { return; };
+        let rebuilt = match rollouts.replay_all() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("rollout replay failed: {e}");
+                return;
+            }
+        };
+        let mut guard = self.inner.lock().await;
+        for r in rebuilt {
+            let stored = StoredThread {
+                thread: r.thread.clone(),
+                turns: r.turns,
+                model: r.model,
+                system_prompt: r.system_prompt,
+                cwd: r.cwd,
+                name: r.name,
+                goal: None,
+                subscribed: false,
+            };
+            if r.archived {
+                guard.archived.insert(r.thread.id.clone(), stored);
+            } else {
+                guard.threads.insert(r.thread.id.clone(), stored);
+            }
+        }
+    }
 
     pub async fn create(
         &self,
@@ -52,7 +93,11 @@ impl ThreadStore {
             created_at: Utc::now().timestamp(),
             updated_at: Some(Utc::now().timestamp()),
             ephemeral: Some(ephemeral),
-            path: None,
+            path: self
+                .rollouts
+                .as_ref()
+                .filter(|_| !ephemeral)
+                .map(|r| r.thread_path(&id).to_string_lossy().into_owned()),
             session_id: Some(id.clone()),
             forked_from_id: None,
             status: ThreadStatus::Idle,
@@ -62,13 +107,26 @@ impl ThreadStore {
         guard.threads.insert(id.clone(), StoredThread {
             thread: thread.clone(),
             turns: vec![],
-            model,
-            system_prompt,
-            cwd,
+            model: model.clone(),
+            system_prompt: system_prompt.clone(),
+            cwd: cwd.clone(),
             name: None,
             goal: None,
             subscribed: true,
         });
+        if !ephemeral {
+            if let Some(rollouts) = &self.rollouts {
+                rollouts
+                    .append(&id, RolloutEvent::ThreadCreated {
+                        thread: thread.clone(),
+                        model,
+                        system_prompt,
+                        cwd,
+                        ts: RolloutStore::now(),
+                    })
+                    .await;
+            }
+        }
         thread
     }
 
@@ -101,6 +159,11 @@ impl ThreadStore {
         forked.session_id = Some(new_id.clone());
         forked.ephemeral = Some(ephemeral);
         forked.turns = src.turns.clone();
+        forked.path = self
+            .rollouts
+            .as_ref()
+            .filter(|_| !ephemeral)
+            .map(|r| r.thread_path(&new_id).to_string_lossy().into_owned());
         let stored = StoredThread {
             thread: forked.clone(),
             turns: src.turns.clone(),
@@ -111,7 +174,57 @@ impl ThreadStore {
             goal: None,
             subscribed: true,
         };
-        guard.threads.insert(new_id, stored);
+        guard.threads.insert(new_id.clone(), stored);
+        drop(guard);
+        if !ephemeral {
+            if let Some(rollouts) = &self.rollouts {
+                rollouts
+                    .append(&new_id, RolloutEvent::ThreadCreated {
+                        thread: forked.clone(),
+                        model: src.model,
+                        system_prompt: src.system_prompt,
+                        cwd: src.cwd,
+                        ts: RolloutStore::now(),
+                    })
+                    .await;
+                // Copy the source's history so resumes look identical.
+                for turn in &src.turns {
+                    let user_input: Vec<InputChunk> = turn
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Item::UserMessage { content, .. } => Some(content.clone()),
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect();
+                    rollouts
+                        .append(&new_id, RolloutEvent::TurnStarted {
+                            turn_id: turn.id.clone(),
+                            input: user_input,
+                            ts: RolloutStore::now(),
+                        })
+                        .await;
+                    for item in &turn.items {
+                        if matches!(item, Item::UserMessage { .. }) { continue; }
+                        rollouts
+                            .append(&new_id, RolloutEvent::ItemAppended {
+                                turn_id: turn.id.clone(),
+                                item: item.clone(),
+                                ts: RolloutStore::now(),
+                            })
+                            .await;
+                    }
+                    rollouts
+                        .append(&new_id, RolloutEvent::TurnCompleted {
+                            turn_id: turn.id.clone(),
+                            status: turn.status,
+                            ts: RolloutStore::now(),
+                        })
+                        .await;
+                }
+            }
+        }
         Some(forked)
     }
 
@@ -120,6 +233,12 @@ impl ThreadStore {
         let Some(stored) = guard.threads.remove(id) else { return None; };
         let thread = stored.thread.clone();
         guard.archived.insert(id.to_string(), stored);
+        drop(guard);
+        if let Some(rollouts) = &self.rollouts {
+            rollouts
+                .append(id, RolloutEvent::Archived { ts: RolloutStore::now() })
+                .await;
+        }
         Some(thread)
     }
 
@@ -128,6 +247,12 @@ impl ThreadStore {
         let Some(stored) = guard.archived.remove(id) else { return None; };
         let thread = stored.thread.clone();
         guard.threads.insert(id.to_string(), stored);
+        drop(guard);
+        if let Some(rollouts) = &self.rollouts {
+            rollouts
+                .append(id, RolloutEvent::Unarchived { ts: RolloutStore::now() })
+                .await;
+        }
         Some(thread)
     }
 
@@ -136,6 +261,12 @@ impl ThreadStore {
         let stored = guard.threads.get_mut(id)?;
         stored.name = Some(name.clone());
         stored.thread.updated_at = Some(Utc::now().timestamp());
+        drop(guard);
+        if let Some(rollouts) = &self.rollouts {
+            rollouts
+                .append(id, RolloutEvent::NameSet { name: name.clone(), ts: RolloutStore::now() })
+                .await;
+        }
         Some(name)
     }
 
@@ -198,10 +329,10 @@ impl ThreadStore {
         let turn_id = format!("turn_{}", Uuid::now_v7());
         let user_item = Item::UserMessage {
             id: turn_id.clone(),
-            content: input,
+            content: input.clone(),
         };
         let turn = Turn {
-            id: turn_id,
+            id: turn_id.clone(),
             status: TurnStatus::InProgress,
             items: vec![user_item],
             error: None,
@@ -209,6 +340,19 @@ impl ThreadStore {
         stored.turns.push(turn.clone());
         stored.thread.turns = stored.turns.clone();
         stored.thread.status = ThreadStatus::Active { active_flags: vec![] };
+        let ephemeral = stored.thread.ephemeral.unwrap_or(false);
+        drop(guard);
+        if !ephemeral {
+            if let Some(rollouts) = &self.rollouts {
+                rollouts
+                    .append(thread_id, RolloutEvent::TurnStarted {
+                        turn_id: turn.id.clone(),
+                        input,
+                        ts: RolloutStore::now(),
+                    })
+                    .await;
+            }
+        }
         Some(turn)
     }
 
@@ -221,14 +365,19 @@ impl ThreadStore {
     ) -> Option<Turn> {
         let mut guard = self.inner.lock().await;
         let stored = guard.threads.get_mut(thread_id)?;
+        let appended_item = if agent_text.is_empty() {
+            None
+        } else {
+            Some(Item::AgentMessage {
+                id: format!("msg_{}", Uuid::now_v7()),
+                text: agent_text.clone(),
+            })
+        };
         let updated_turn = {
             let turn = stored.turns.iter_mut().find(|t| t.id == turn_id)?;
             turn.status = status;
-            if !agent_text.is_empty() {
-                turn.items.push(Item::AgentMessage {
-                    id: format!("msg_{}", Uuid::now_v7()),
-                    text: agent_text.clone(),
-                });
+            if let Some(item) = appended_item.clone() {
+                turn.items.push(item);
             }
             turn.clone()
         };
@@ -236,6 +385,28 @@ impl ThreadStore {
         stored.thread.preview = agent_text.chars().take(80).collect();
         stored.thread.updated_at = Some(Utc::now().timestamp());
         stored.thread.turns = stored.turns.clone();
+        let ephemeral = stored.thread.ephemeral.unwrap_or(false);
+        drop(guard);
+        if !ephemeral {
+            if let Some(rollouts) = &self.rollouts {
+                if let Some(item) = appended_item {
+                    rollouts
+                        .append(thread_id, RolloutEvent::ItemAppended {
+                            turn_id: turn_id.to_string(),
+                            item,
+                            ts: RolloutStore::now(),
+                        })
+                        .await;
+                }
+                rollouts
+                    .append(thread_id, RolloutEvent::TurnCompleted {
+                        turn_id: turn_id.to_string(),
+                        status,
+                        ts: RolloutStore::now(),
+                    })
+                    .await;
+            }
+        }
         Some(updated_turn)
     }
 }

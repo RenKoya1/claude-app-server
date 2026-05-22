@@ -34,9 +34,18 @@ pub struct MessageProcessor {
 
 impl MessageProcessor {
     pub fn new(out: OutgoingSender, sidecar: SidecarClient, default_model: String) -> Self {
+        Self::with_store(out, sidecar, default_model, ThreadStore::new())
+    }
+
+    pub fn with_store(
+        out: OutgoingSender,
+        sidecar: SidecarClient,
+        default_model: String,
+        store: ThreadStore,
+    ) -> Self {
         Self {
             out,
-            store: ThreadStore::new(),
+            store,
             sidecar,
             initialized: Arc::new(Mutex::new(false)),
             default_model,

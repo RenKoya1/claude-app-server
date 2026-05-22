@@ -1,7 +1,20 @@
 # Releasing (maintainers only)
 
 End users do not need this file. See [README.md](README.md) for install +
-usage.
+usage. Contributors should read [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Access required
+
+To cut a release you need **all** of the following. If you don't, stop:
+
+- Push access to `RenKoya1/claude-app-server` `main` (to push commits + tags).
+- `NPM_TOKEN` repository secret on the GitHub repo (set via
+  `gh secret set NPM_TOKEN --repo RenKoya1/claude-app-server`).
+- Local `gh` CLI authenticated to a GitHub account with the access above.
+
+Contributors **cannot** publish to npm. The npm token is repo-scoped, only
+the CI workflow can read it, and the workflow only runs on tag pushes to
+`main` — both of which require maintainer push access.
 
 End-to-end release is a single command:
 

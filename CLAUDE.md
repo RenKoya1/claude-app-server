@@ -31,9 +31,11 @@ passed against the current working tree:**
    ```bash
    npm pack --dry-run 2>&1 | grep -E "package size|unpacked size"
    ```
-   Budget: **tarball ≤ 15 MB**, **unpacked ≤ 85 MB**. If exceeded, halt
-   and investigate — likely a regression in `npm prune --omit=dev` or
-   ripgrep prune.
+   Budget: **tarball ≤ 40 MB**, **unpacked ≤ 100 MB**. The floor is set
+   by the Claude Agent SDK's per-platform ripgrep vendor binaries
+   (~40 MB across darwin x2 + linux x2). If exceeded, investigate —
+   likely a regression in `npm prune --omit=dev` or the win32 ripgrep
+   strip.
 6. **Git working tree is clean** and on `main`. No
    `--no-verify`, no force-push to main, no skipping the release
    precheck in `scripts/release.mjs`.
@@ -90,7 +92,7 @@ node_modules/.bin/claude-app-server < /tmp/cas_smoke.jsonl > /tmp/cas_verify_out
 grep -c '"error"' /tmp/cas_verify_out.jsonl   # MUST be 0
 
 # Size budget on user disk.
-du -sh node_modules/@renkoya1/claude-app-server/   # < 60 MB
+du -sh node_modules/@renkoya1/claude-app-server/   # ~55 MB after postinstall prune
 ```
 
 If verification fails: **immediately publish a patch** that fixes the
