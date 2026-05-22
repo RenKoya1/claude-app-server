@@ -138,6 +138,30 @@ impl MessageProcessor {
                 self.handle_command_exec_terminate(id, params).await
             }
 
+            // v0.4.0 additions
+            proto::request::THREAD_TURNS_LIST => self.handle_thread_turns_list(id, params).await,
+            proto::request::THREAD_TURNS_ITEMS_LIST => {
+                self.out
+                    .error(id, proto::METHOD_NOT_FOUND, "thread/turns/items/list is not supported yet")
+                    .await
+            }
+            proto::request::THREAD_METADATA_UPDATE => self.handle_thread_metadata_update(id, params).await,
+            proto::request::THREAD_SETTINGS_UPDATE => self.handle_thread_settings_update(id, params).await,
+            proto::request::THREAD_ROLLBACK => self.handle_thread_rollback(id, params).await,
+            proto::request::THREAD_SHELL_COMMAND => self.handle_thread_shell_command(id, params).await,
+            proto::request::THREAD_BACKGROUND_TERMINALS_CLEAN => {
+                self.handle_thread_bg_terminals_clean(id, params).await
+            }
+            proto::request::THREAD_MEMORY_MODE_SET => self.handle_thread_memory_mode_set(id, params).await,
+            proto::request::MEMORY_RESET => self.handle_memory_reset(id).await,
+            proto::request::PERMISSION_PROFILE_LIST => self.handle_permission_profile_list(id).await,
+            proto::request::EXPERIMENTAL_FEATURE_LIST => self.handle_experimental_feature_list(id).await,
+            proto::request::COLLABORATION_MODE_LIST => self.handle_collaboration_mode_list(id).await,
+            proto::request::MODEL_PROVIDER_CAPABILITIES_READ => {
+                self.handle_model_provider_capabilities(id).await
+            }
+            proto::request::REVIEW_START => self.handle_review_start(id, params).await,
+
             other => {
                 self.out
                     .error(
@@ -957,6 +981,374 @@ impl MessageProcessor {
             .notify(
                 proto::notification::THREAD_ARCHIVED,
                 &serde_json::json!({ "threadId": thread_id }),
+            )
+            .await;
+    }
+
+    // --- v0.4.0 handlers -----------------------------------------------
+
+    async fn handle_thread_turns_list(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadTurnsListParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(stored) = self.store.get(&p.thread_id).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        let descending = p.sort_direction.as_deref() != Some("asc");
+        let items_view = p.items_view.as_deref().unwrap_or("summary").to_string();
+        let limit = p.limit.unwrap_or(50).max(1) as usize;
+        let offset = p.cursor.as_deref().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        let total = stored.turns.len();
+        let mut all: Vec<_> = stored.turns.clone();
+        if descending { all.reverse(); }
+        let end = (offset + limit).min(total);
+        let slice = &all[offset.min(total)..end];
+        let data: Vec<proto::TurnPage> = slice.iter().map(|t| {
+            let items = if items_view == "full" {
+                t.items.clone()
+            } else if items_view == "notLoaded" {
+                vec![]
+            } else {
+                // summary: keep only top-level assistant text + tool use names
+                t.items.iter().filter(|i| matches!(
+                    i,
+                    proto::Item::AgentMessage { .. }
+                        | proto::Item::UserMessage { .. }
+                        | proto::Item::ToolUse { .. }
+                )).cloned().collect()
+            };
+            proto::TurnPage {
+                id: t.id.clone(),
+                status: t.status,
+                items,
+                items_view: items_view.clone(),
+            }
+        }).collect();
+        let next_cursor = if end < total { Some(end.to_string()) } else { None };
+        let backwards_cursor = if offset > 0 { Some(offset.to_string()) } else { None };
+        self.out
+            .respond(id, &proto::ThreadTurnsListResult { data, next_cursor, backwards_cursor })
+            .await;
+    }
+
+    async fn handle_thread_metadata_update(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadMetadataUpdateParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(thread) = self.store.update_metadata(&p.thread_id, p.git_info).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        self.out.respond(id, &serde_json::json!({ "thread": thread })).await;
+        self.out
+            .notify(
+                proto::notification::THREAD_METADATA_UPDATED,
+                &serde_json::json!({ "threadId": p.thread_id }),
+            )
+            .await;
+    }
+
+    async fn handle_thread_settings_update(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadSettingsUpdateParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(settings) = self.store.update_settings(&p.thread_id, p.settings).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        self.out.respond_empty(id).await;
+        self.out
+            .notify(
+                proto::notification::THREAD_SETTINGS_UPDATED,
+                &serde_json::json!({ "threadId": p.thread_id, "threadSettings": settings }),
+            )
+            .await;
+    }
+
+    async fn handle_thread_rollback(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadRollbackParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(thread) = self.store.rollback(&p.thread_id, p.turns).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        self.out.respond(id, &serde_json::json!({ "thread": thread })).await;
+    }
+
+    async fn handle_thread_shell_command(self: Arc<Self>, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadShellCommandParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let stored = self.store.get(&p.thread_id).await;
+        let cwd = stored.as_ref().and_then(|s| s.cwd.clone());
+        self.out.respond_empty(id).await;
+        let store = self.store.clone();
+        let out = self.out.clone();
+        let exec = self.exec_registry.clone();
+        let thread_id = p.thread_id.clone();
+        let command = p.command.clone();
+        tokio::spawn(async move {
+            // Emit synthetic item flow for the ! command: started → output → completed.
+            let item_id = format!("cmd_{}", Uuid::now_v7());
+            let user_item = proto::Item::UserMessage {
+                id: item_id.clone(),
+                content: vec![proto::InputChunk::Text { text: format!("! {command}") }],
+            };
+            out.item_started(&proto::ItemStartedEvent {
+                thread_id: thread_id.clone(),
+                turn_id: item_id.clone(),
+                item: user_item.clone(),
+            }).await;
+            let params = proto::CommandExecParams {
+                command: vec!["bash".into(), "-lc".into(), command],
+                process_id: Some(item_id.clone()),
+                cwd,
+                env: Default::default(),
+                timeout_ms: None,
+                disable_timeout: false,
+                output_bytes_cap: None,
+                disable_output_cap: false,
+                stream_stdout_stderr: false,
+            };
+            let result = exec.run(params, out.clone()).await;
+            let completed_item = match &result {
+                Ok(r) => proto::Item::AgentMessage {
+                    id: format!("msg_{}", Uuid::now_v7()),
+                    text: format!("$ exit {}\n{}{}", r.exit_code, r.stdout, r.stderr),
+                },
+                Err(e) => proto::Item::AgentMessage {
+                    id: format!("msg_{}", Uuid::now_v7()),
+                    text: format!("$ exec failed: {e}"),
+                },
+            };
+            out.item_completed(&proto::ItemCompletedEvent {
+                thread_id: thread_id.clone(),
+                turn_id: item_id.clone(),
+                item: completed_item.clone(),
+            }).await;
+            // Persist as a turn if rollouts enabled.
+            let _ = store.start_turn(&thread_id, vec![proto::InputChunk::Text { text: "! (shell)".into() }]).await;
+        });
+    }
+
+    async fn handle_thread_bg_terminals_clean(&self, id: proto::RequestId, params: serde_json::Value) {
+        let _p: proto::ThreadBackgroundTerminalsCleanParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        // The Claude Agent SDK manages its own background tool processes;
+        // we cannot reach into them from outside the sidecar today.
+        // Acknowledge the request so clients can call it without erroring.
+        self.out.respond_empty(id).await;
+    }
+
+    async fn handle_thread_memory_mode_set(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadMemoryModeSetParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        if !self.store.set_memory_mode(&p.thread_id, p.mode.clone()).await {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        }
+        self.out.respond_empty(id).await;
+        self.out
+            .notify(
+                proto::notification::THREAD_MEMORY_MODE_CHANGED,
+                &serde_json::json!({ "threadId": p.thread_id, "mode": p.mode }),
+            )
+            .await;
+    }
+
+    async fn handle_memory_reset(&self, id: proto::RequestId) {
+        let home = std::env::var("CLAUDE_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.claude")))
+            .unwrap_or_else(|_| ".claude".into());
+        let memories_dir = std::path::PathBuf::from(home).join("memories");
+        if memories_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&memories_dir) {
+                self.out
+                    .error(id, proto::INTERNAL_ERROR, format!("could not remove memories: {e}"))
+                    .await;
+                return;
+            }
+        }
+        let _ = std::fs::create_dir_all(&memories_dir);
+        self.out.respond_empty(id).await;
+    }
+
+    async fn handle_permission_profile_list(&self, id: proto::RequestId) {
+        let data = vec![
+            proto::PermissionProfileDescriptor {
+                id: "default".into(),
+                description: Some("Prompt before destructive tool use.".into()),
+            },
+            proto::PermissionProfileDescriptor {
+                id: "acceptEdits".into(),
+                description: Some("Auto-approve file edits, prompt for other tools.".into()),
+            },
+            proto::PermissionProfileDescriptor {
+                id: "bypassPermissions".into(),
+                description: Some("Skip permission prompts (used by app-server by default).".into()),
+            },
+            proto::PermissionProfileDescriptor {
+                id: "plan".into(),
+                description: Some("Plan-only mode; no tool execution.".into()),
+            },
+            proto::PermissionProfileDescriptor {
+                id: "delegate".into(),
+                description: Some("Delegate to a subagent's permission decision.".into()),
+            },
+            proto::PermissionProfileDescriptor {
+                id: "dontAsk".into(),
+                description: Some("Never ask the user; deny anything not pre-approved.".into()),
+            },
+        ];
+        self.out.respond(id, &proto::PermissionProfileListResult { data }).await;
+    }
+
+    async fn handle_experimental_feature_list(&self, id: proto::RequestId) {
+        let data = vec![
+            proto::ExperimentalFeatureDescriptor {
+                id: "websocket_transport".into(),
+                stage: "stable".into(),
+                enabled: true,
+                description: Some("Listen on ws://HOST:PORT for multi-client connections.".into()),
+            },
+            proto::ExperimentalFeatureDescriptor {
+                id: "jsonl_rollouts".into(),
+                stage: "stable".into(),
+                enabled: true,
+                description: Some("Persist threads as JSONL under $CLAUDE_HOME/sessions/.".into()),
+            },
+            proto::ExperimentalFeatureDescriptor {
+                id: "schema_export".into(),
+                stage: "beta".into(),
+                enabled: true,
+                description: Some("Run `generate-ts` / `generate-json-schema` subcommands.".into()),
+            },
+        ];
+        self.out.respond(id, &proto::ExperimentalFeatureListResult { data }).await;
+    }
+
+    async fn handle_collaboration_mode_list(&self, id: proto::RequestId) {
+        let data = vec![
+            proto::CollaborationModeDescriptor {
+                id: "code".into(),
+                display_name: "Code".into(),
+                description: Some("Default Claude Code collaboration mode.".into()),
+            },
+            proto::CollaborationModeDescriptor {
+                id: "plan".into(),
+                display_name: "Plan".into(),
+                description: Some("Plan-only; no tool execution.".into()),
+            },
+            proto::CollaborationModeDescriptor {
+                id: "review".into(),
+                display_name: "Review".into(),
+                description: Some("Focused code review with structured findings.".into()),
+            },
+        ];
+        self.out.respond(id, &proto::CollaborationModeListResult { data }).await;
+    }
+
+    async fn handle_model_provider_capabilities(&self, id: proto::RequestId) {
+        let result = proto::ModelProviderCapabilities {
+            name: "anthropic".into(),
+            streaming: true,
+            tool_use: true,
+            vision: true,
+            extended_thinking: true,
+            prompt_caching: true,
+            mcp: true,
+        };
+        self.out.respond(id, &result).await;
+    }
+
+    async fn handle_review_start(self: Arc<Self>, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ReviewStartParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(stored) = self.store.get(&p.thread_id).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        let prompt = match &p.target {
+            proto::ReviewTarget::UncommittedChanges => {
+                "You are reviewing the uncommitted changes in this workspace. Use git status / git diff to read them. Produce a focused review.".to_string()
+            }
+            proto::ReviewTarget::BaseBranch { branch } => {
+                format!("Review the difference between HEAD and the base branch `{branch}`. Use `git diff $(git merge-base HEAD {branch})...HEAD` to see it.")
+            }
+            proto::ReviewTarget::Commit { sha, title } => match title {
+                Some(t) => format!("Review commit {sha} ({t}). Use `git show {sha}`."),
+                None => format!("Review commit {sha}. Use `git show {sha}`."),
+            },
+            proto::ReviewTarget::Custom { instructions } => instructions.clone(),
+        };
+
+        let turn = match self.store.start_turn(
+            &p.thread_id,
+            vec![proto::InputChunk::Text { text: prompt.clone() }],
+        ).await {
+            Some(t) => t,
+            None => {
+                self.out.error(id, proto::INTERNAL_ERROR, "Could not start review turn").await;
+                return;
+            }
+        };
+
+        self.out
+            .respond(
+                id,
+                &proto::ReviewStartResult {
+                    turn: turn.clone(),
+                    review_thread_id: p.thread_id.clone(),
+                },
+            )
+            .await;
+
+        // Emit the entered-review-mode item so clients can render UI state.
+        // We piggyback on the existing turn streaming loop by issuing a
+        // turn through the sidecar with the review prompt.
+        let needs_create = {
+            let mut set = self.created_sessions.lock().await;
+            if set.contains(&p.thread_id) { false } else {
+                set.insert(p.thread_id.clone());
+                true
+            }
+        };
+        if needs_create {
+            let opts = crate::sidecar::SidecarSessionOptions {
+                cwd: stored.cwd.clone(),
+                model: Some(stored.model.clone()),
+                system_prompt: Some(stored.system_prompt.clone()),
+                permission_mode: Some("bypassPermissions".into()),
+                allowed_tools: None,
+                disallowed_tools: None,
+                max_turns: Some(20),
+                include_partial_messages: Some(true),
+                resume: None,
+            };
+            if let Err(e) = self.sidecar.create_session(&p.thread_id, Some(opts)).await {
+                tracing::warn!("review create_session failed: {e}");
+                return;
+            }
+        }
+        let _ = self
+            .sidecar
+            .turn(
+                &p.thread_id,
+                &turn.id,
+                vec![crate::sidecar::TurnInput::Text { text: prompt }],
             )
             .await;
     }

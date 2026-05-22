@@ -56,6 +56,26 @@ pub mod request {
     pub const COMMAND_EXEC: &str = "command/exec";
     pub const COMMAND_EXEC_WRITE: &str = "command/exec/write";
     pub const COMMAND_EXEC_TERMINATE: &str = "command/exec/terminate";
+
+    // Pagination / metadata
+    pub const THREAD_TURNS_LIST: &str = "thread/turns/list";
+    pub const THREAD_TURNS_ITEMS_LIST: &str = "thread/turns/items/list";
+    pub const THREAD_METADATA_UPDATE: &str = "thread/metadata/update";
+    pub const THREAD_SETTINGS_UPDATE: &str = "thread/settings/update";
+    pub const THREAD_ROLLBACK: &str = "thread/rollback";
+    pub const THREAD_SHELL_COMMAND: &str = "thread/shellCommand";
+    pub const THREAD_BACKGROUND_TERMINALS_CLEAN: &str = "thread/backgroundTerminals/clean";
+    pub const THREAD_MEMORY_MODE_SET: &str = "thread/memoryMode/set";
+    pub const MEMORY_RESET: &str = "memory/reset";
+
+    // Capability lists
+    pub const PERMISSION_PROFILE_LIST: &str = "permissionProfile/list";
+    pub const EXPERIMENTAL_FEATURE_LIST: &str = "experimentalFeature/list";
+    pub const COLLABORATION_MODE_LIST: &str = "collaborationMode/list";
+    pub const MODEL_PROVIDER_CAPABILITIES_READ: &str = "modelProvider/capabilities/read";
+
+    // Review
+    pub const REVIEW_START: &str = "review/start";
 }
 
 pub mod notification {
@@ -86,4 +106,9 @@ pub mod notification {
 
     // Exec
     pub const COMMAND_EXEC_OUTPUT_DELTA: &str = "command/exec/outputDelta";
+
+    // v0.4.0 thread mutators
+    pub const THREAD_METADATA_UPDATED: &str = "thread/metadata/updated";
+    pub const THREAD_SETTINGS_UPDATED: &str = "thread/settings/updated";
+    pub const THREAD_MEMORY_MODE_CHANGED: &str = "thread/memoryMode/changed";
 }

@@ -18,8 +18,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-const INGRESS_CAPACITY: usize = 256;
-const OUTBOUND_CAPACITY: usize = 1024;
+const DEFAULT_INGRESS_CAPACITY: usize = 256;
+const DEFAULT_OUTBOUND_CAPACITY: usize = 1024;
+
+fn ingress_capacity() -> usize {
+    std::env::var("CLAUDE_APP_SERVER_INGRESS_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_INGRESS_CAPACITY)
+}
+
+fn outbound_capacity() -> usize {
+    std::env::var("CLAUDE_APP_SERVER_OUTBOUND_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_OUTBOUND_CAPACITY)
+}
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -37,8 +51,8 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn spawn() -> Self {
-        let (ingress_tx, ingress_rx) = mpsc::channel::<JsonRpcMessage>(INGRESS_CAPACITY);
-        let (outbound_tx, outbound_rx) = mpsc::channel::<JsonRpcMessage>(OUTBOUND_CAPACITY);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<JsonRpcMessage>(ingress_capacity());
+        let (outbound_tx, outbound_rx) = mpsc::channel::<JsonRpcMessage>(outbound_capacity());
 
         // Reader: stdin -> ingress_tx. On backpressure (ingress full and message is a Request),
         // synthesize a -32001 overload error directly to outbound_tx.

@@ -22,6 +22,9 @@ pub struct StoredThread {
     pub name: Option<String>,
     pub goal: Option<ThreadGoal>,
     pub subscribed: bool,
+    pub git_info: Option<claude_app_server_protocol::GitInfo>,
+    pub memory_mode: Option<String>,
+    pub settings: claude_app_server_protocol::ThreadSettings,
 }
 
 #[derive(Clone, Default)]
@@ -69,6 +72,9 @@ impl ThreadStore {
                 name: r.name,
                 goal: None,
                 subscribed: false,
+                git_info: None,
+                memory_mode: None,
+                settings: Default::default(),
             };
             if r.archived {
                 guard.archived.insert(r.thread.id.clone(), stored);
@@ -113,6 +119,9 @@ impl ThreadStore {
             name: None,
             goal: None,
             subscribed: true,
+            git_info: None,
+            memory_mode: None,
+            settings: Default::default(),
         });
         if !ephemeral {
             if let Some(rollouts) = &self.rollouts {
@@ -173,6 +182,9 @@ impl ThreadStore {
             name: None,
             goal: None,
             subscribed: true,
+            git_info: None,
+            memory_mode: None,
+            settings: Default::default(),
         };
         guard.threads.insert(new_id.clone(), stored);
         drop(guard);
@@ -310,6 +322,58 @@ impl ThreadStore {
     pub async fn get_goal(&self, thread_id: &str) -> Option<ThreadGoal> {
         let guard = self.inner.lock().await;
         guard.threads.get(thread_id)?.goal.clone()
+    }
+
+    pub async fn rollback(&self, thread_id: &str, n: u32) -> Option<Thread> {
+        let mut guard = self.inner.lock().await;
+        let stored = guard.threads.get_mut(thread_id)?;
+        let drop_count = (n as usize).min(stored.turns.len());
+        let new_len = stored.turns.len() - drop_count;
+        stored.turns.truncate(new_len);
+        stored.thread.turns = stored.turns.clone();
+        stored.thread.updated_at = Some(Utc::now().timestamp());
+        Some(stored.thread.clone())
+    }
+
+    pub async fn update_metadata(
+        &self,
+        thread_id: &str,
+        git_info: Option<claude_app_server_protocol::GitInfo>,
+    ) -> Option<Thread> {
+        let mut guard = self.inner.lock().await;
+        let stored = guard.threads.get_mut(thread_id)?;
+        if let Some(gi) = git_info {
+            stored.git_info = Some(gi);
+        }
+        stored.thread.updated_at = Some(Utc::now().timestamp());
+        Some(stored.thread.clone())
+    }
+
+    pub async fn update_settings(
+        &self,
+        thread_id: &str,
+        patch: claude_app_server_protocol::ThreadSettings,
+    ) -> Option<claude_app_server_protocol::ThreadSettings> {
+        let mut guard = self.inner.lock().await;
+        let stored = guard.threads.get_mut(thread_id)?;
+        if let Some(m) = patch.model { stored.settings.model = Some(m); stored.model = stored.settings.model.clone().unwrap(); }
+        if let Some(sp) = patch.system_prompt { stored.settings.system_prompt = Some(sp.clone()); stored.system_prompt = Some(sp); }
+        if let Some(pm) = patch.permission_mode { stored.settings.permission_mode = Some(pm); }
+        if let Some(c) = patch.cwd { stored.settings.cwd = Some(c.clone()); stored.cwd = Some(c); }
+        Some(stored.settings.clone())
+    }
+
+    pub async fn set_memory_mode(&self, thread_id: &str, mode: String) -> bool {
+        let mut guard = self.inner.lock().await;
+        if let Some(stored) = guard.threads.get_mut(thread_id) {
+            stored.memory_mode = Some(mode);
+            return true;
+        }
+        if let Some(stored) = guard.archived.get_mut(thread_id) {
+            stored.memory_mode = Some(mode);
+            return true;
+        }
+        false
     }
 
     pub async fn clear_goal(&self, thread_id: &str) -> bool {

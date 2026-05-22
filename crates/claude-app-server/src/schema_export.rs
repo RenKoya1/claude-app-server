@@ -337,6 +337,20 @@ export const Methods = {
   commandExec: "command/exec",
   commandExecWrite: "command/exec/write",
   commandExecTerminate: "command/exec/terminate",
+  threadTurnsList: "thread/turns/list",
+  threadTurnsItemsList: "thread/turns/items/list",
+  threadMetadataUpdate: "thread/metadata/update",
+  threadSettingsUpdate: "thread/settings/update",
+  threadRollback: "thread/rollback",
+  threadShellCommand: "thread/shellCommand",
+  threadBackgroundTerminalsClean: "thread/backgroundTerminals/clean",
+  threadMemoryModeSet: "thread/memoryMode/set",
+  memoryReset: "memory/reset",
+  permissionProfileList: "permissionProfile/list",
+  experimentalFeatureList: "experimentalFeature/list",
+  collaborationModeList: "collaborationMode/list",
+  modelProviderCapabilitiesRead: "modelProvider/capabilities/read",
+  reviewStart: "review/start",
 } as const;
 
 export const Notifications = {
@@ -356,6 +370,9 @@ export const Notifications = {
   itemAgentMessageDelta: "item/agentMessage/delta",
   fsChanged: "fs/changed",
   commandExecOutputDelta: "command/exec/outputDelta",
+  threadMetadataUpdated: "thread/metadata/updated",
+  threadSettingsUpdated: "thread/settings/updated",
+  threadMemoryModeChanged: "thread/memoryMode/changed",
 } as const;
 "#;
 
