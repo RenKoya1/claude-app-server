@@ -12,6 +12,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// Per-thread Claude Agent SDK option overrides. Stored as an opaque
+/// JSON map so that **any** SDK option works — including options the
+/// frontend has never heard of. The processor adds ergonomic defaults
+/// (`permissionMode: "bypassPermissions"`, `includePartialMessages:
+/// true`) only when the user did not supply them.
+pub type ThreadCustomization = serde_json::Map<String, serde_json::Value>;
+
 #[derive(Debug, Clone)]
 pub struct StoredThread {
     pub thread: Thread,
@@ -25,6 +32,7 @@ pub struct StoredThread {
     pub git_info: Option<claude_app_server_protocol::GitInfo>,
     pub memory_mode: Option<String>,
     pub settings: claude_app_server_protocol::ThreadSettings,
+    pub customization: ThreadCustomization,
 }
 
 #[derive(Clone, Default)]
@@ -75,6 +83,7 @@ impl ThreadStore {
                 git_info: None,
                 memory_mode: None,
                 settings: Default::default(),
+                customization: serde_json::Map::new(),
             };
             if r.archived {
                 guard.archived.insert(r.thread.id.clone(), stored);
@@ -90,6 +99,24 @@ impl ThreadStore {
         cwd: Option<String>,
         system_prompt: Option<String>,
         ephemeral: bool,
+    ) -> Thread {
+        self.create_with_customization(
+            model,
+            cwd,
+            system_prompt,
+            ephemeral,
+            ThreadCustomization::default(),
+        )
+        .await
+    }
+
+    pub async fn create_with_customization(
+        &self,
+        model: String,
+        cwd: Option<String>,
+        system_prompt: Option<String>,
+        ephemeral: bool,
+        customization: ThreadCustomization,
     ) -> Thread {
         let id = format!("thr_{}", Uuid::now_v7());
         let thread = Thread {
@@ -122,7 +149,9 @@ impl ThreadStore {
             git_info: None,
             memory_mode: None,
             settings: Default::default(),
+            customization,
         });
+
         if !ephemeral {
             if let Some(rollouts) = &self.rollouts {
                 rollouts
@@ -185,6 +214,7 @@ impl ThreadStore {
             git_info: None,
             memory_mode: None,
             settings: Default::default(),
+            customization: serde_json::Map::new(),
         };
         guard.threads.insert(new_id.clone(), stored);
         drop(guard);

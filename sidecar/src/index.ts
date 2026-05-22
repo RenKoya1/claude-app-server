@@ -32,6 +32,10 @@ interface SessionOptions {
   maxTurns?: number;
   includePartialMessages?: boolean;
   resume?: string;
+  additionalDirectories?: string[];
+  env?: Record<string, string>;
+  mcpServers?: Record<string, unknown>;
+  agents?: Record<string, unknown>;
 }
 
 type InboundCommand =
@@ -199,6 +203,10 @@ function buildOptions(spec: SessionOptions, abort: AbortController): Options {
     disallowedTools: spec.disallowedTools,
     maxTurns: spec.maxTurns,
     resume: spec.resume,
+    additionalDirectories: spec.additionalDirectories,
+    env: spec.env,
+    mcpServers: spec.mcpServers as Options["mcpServers"] | undefined,
+    agents: spec.agents as Options["agents"] | undefined,
   };
   if (spec.systemPrompt === null) {
     opts.systemPrompt = { type: "preset", preset: "claude_code" } as unknown as Options["systemPrompt"];

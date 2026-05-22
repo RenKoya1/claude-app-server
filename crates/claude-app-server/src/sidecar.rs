@@ -91,30 +91,33 @@ enum OutboundCommand {
     Shutdown { id: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SidecarSessionOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// `None` → omit, sidecar uses SDK default. `Some(None)` → null, which the
-    /// sidecar interprets as "use the claude_code preset". `Some(Some("..."))`
-    /// → explicit string.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_tools: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disallowed_tools: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_partial_messages: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resume: Option<String>,
+/// Opaque session-options blob. Whatever JSON we put here is forwarded
+/// verbatim into the sidecar's `query({ options: ... })` call. Use any
+/// key the `@anthropic-ai/claude-agent-sdk` `Options` type accepts —
+/// `mcpServers`, `agents`, `hooks` (callbacks not supported via JSON),
+/// `additionalDirectories`, `env`, `allowedTools`, `disallowedTools`,
+/// `permissionMode`, `maxTurns`, etc. The frontend does not validate the
+/// shape; if the SDK rejects it the sidecar emits a `turnCompleted`
+/// error event with the upstream message.
+pub type SidecarSessionOptions = serde_json::Map<String, Value>;
+
+/// Helper: build a session-options blob, merging known keys with an
+/// arbitrary passthrough map. The passthrough wins when keys collide so
+/// callers can override defaults from the typed ergonomic surface.
+pub fn build_session_options(
+    typed_keys: impl IntoIterator<Item = (&'static str, Value)>,
+    passthrough: serde_json::Map<String, Value>,
+) -> SidecarSessionOptions {
+    let mut map = serde_json::Map::new();
+    for (k, v) in typed_keys {
+        if !v.is_null() {
+            map.insert(k.to_string(), v);
+        }
+    }
+    for (k, v) in passthrough {
+        map.insert(k, v);
+    }
+    map
 }
 
 #[derive(Debug, Clone, Serialize)]

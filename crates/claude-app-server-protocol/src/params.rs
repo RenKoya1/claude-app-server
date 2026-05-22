@@ -20,6 +20,14 @@ pub struct InitializeResult {
     pub platform_os: String,
 }
 
+/// Open-ended thread/start params. The common ergonomic fields are
+/// surfaced explicitly; **any other key the SDK understands is forwarded
+/// untouched** via the `#[serde(flatten)]` `sdk_options` map. This means
+/// new SDK options (hooks, agents, mcpServers, additionalDirectories,
+/// env, allowedTools, disallowedTools, maxTurns, permissionMode,
+/// includePartialMessages, resume, ...) work without a protocol bump:
+/// pass them in `params` at the top level and the sidecar passes them to
+/// `query({ options })`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartParams {
@@ -33,6 +41,12 @@ pub struct ThreadStartParams {
     pub personality: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+
+    /// Any field not listed above is captured here and forwarded verbatim
+    /// to `@anthropic-ai/claude-agent-sdk` `query({ options })`. Use this
+    /// to set ANY SDK option without waiting for a protocol release.
+    #[serde(flatten)]
+    pub sdk_options: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +123,12 @@ pub struct TurnStartParams {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+
+    /// Same open-ended passthrough as `ThreadStartParams.sdk_options`.
+    /// Anything here is forwarded to the SDK's per-turn `query({ options })`
+    /// on the next turn the session runs.
+    #[serde(flatten)]
+    pub sdk_options: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -65,6 +65,71 @@ npx @renkoya1/claude-app-server
 ANTHROPIC_API_KEY=sk-ant-... npx @renkoya1/claude-app-server
 ```
 
+## Building a custom agent
+
+`thread/start` and `turn/start` are **open-ended**: any field that the
+official `@anthropic-ai/claude-agent-sdk` `Options` type accepts is
+forwarded verbatim into the underlying `query({ options })` call. No
+protocol bump is needed to use new SDK options.
+
+Common knobs:
+
+| `params` key             | Effect                                                                  |
+|--------------------------|-------------------------------------------------------------------------|
+| `model`                  | Pick the model (`claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, ...). |
+| `systemPrompt`           | Replace the default Claude Code system prompt with your own.            |
+| `cwd`                    | Working directory the agent operates from.                              |
+| `additionalDirectories`  | Extra directories the agent may read/write beyond `cwd`.                |
+| `permissionMode`         | `default` / `acceptEdits` / `bypassPermissions` / `plan` / `delegate` / `dontAsk`. |
+| `allowedTools`           | Restrict the agent to a tool whitelist (e.g. `["Read", "Grep"]`).       |
+| `disallowedTools`        | Tool blacklist (e.g. `["Bash"]` to forbid shell exec).                  |
+| `maxTurns`               | Cap the autonomous tool-use loop length.                                |
+| `env`                    | Env vars passed into the agent's child processes.                       |
+| `mcpServers`             | Per-thread MCP server registration (DB connectors, internal tools, ...).|
+| `agents`                 | Programmatic subagents reachable via the `Task` tool.                   |
+
+Example — a SQL-only agent with a DB-backed MCP server:
+
+```json
+{
+  "method": "thread/start",
+  "id": 1,
+  "params": {
+    "model": "claude-sonnet-4-6",
+    "systemPrompt": "You are a SQL expert. Use the `db` MCP to query.",
+    "permissionMode": "plan",
+    "allowedTools": ["Read", "Grep"],
+    "maxTurns": 8,
+    "mcpServers": {
+      "db": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["mcp-postgres.js"],
+        "env": { "DATABASE_URL": "postgres://localhost/app" }
+      }
+    },
+    "agents": {
+      "performance-reviewer": {
+        "description": "Reviews SQL plans for performance issues.",
+        "prompt": "You audit query plans. Use EXPLAIN ANALYZE.",
+        "tools": ["Read"]
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- The frontend does **not** type-check unknown keys; the SDK will reject
+  malformed shapes and the server emits a `turn/completed` with
+  `isError: true` and the SDK error in `errors[]`.
+- Some SDK options (notably `hooks` and `abortController`) are
+  JavaScript callbacks and cannot cross the JSON-RPC boundary; they are
+  ignored.
+- The full SDK `Options` reference:
+  https://github.com/anthropics/claude-agent-sdk-typescript
+
 ## Build from source (contributors)
 
 You only need this section if you cloned the repo to develop the server

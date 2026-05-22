@@ -135,12 +135,26 @@ export interface InitializeResult {
 
 // ---------- Threads ----------
 
+/**
+ * thread/start params. Common ergonomic fields are typed; anything else
+ * is forwarded VERBATIM into `@anthropic-ai/claude-agent-sdk`
+ * `query({ options })`. This is intentional — pass any SDK option to
+ * customize your agent (allowedTools, disallowedTools, permissionMode,
+ * maxTurns, mcpServers, agents, additionalDirectories, env, ...) and
+ * future SDK options will work without a protocol release.
+ */
 export interface ThreadStartParams {
   model?: string;
   cwd?: string;
   ephemeral?: boolean;
   personality?: string;
   systemPrompt?: string;
+  /**
+   * Any other key is forwarded directly to the SDK as a query() option.
+   * See https://github.com/anthropics/claude-agent-sdk-typescript for
+   * the full Options type.
+   */
+  [sdkOption: string]: unknown;
 }
 export interface ThreadStartResult { thread: Thread; }
 
@@ -193,12 +207,14 @@ export interface ThreadGoalClearResult { cleared: boolean; }
 
 // ---------- Turns ----------
 
+/** turn/start. Same open-ended SDK options passthrough as ThreadStartParams. */
 export interface TurnStartParams {
   threadId: string;
   input: InputChunk[];
   model?: string;
   cwd?: string;
   systemPrompt?: string;
+  [sdkOption: string]: unknown;
 }
 export interface TurnStartResult { turn: Turn; }
 export interface TurnInterruptParams { threadId: string; turnId: string; }

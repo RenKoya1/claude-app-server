@@ -4,7 +4,9 @@
 use crate::exec::ExecRegistry;
 use crate::fs::{self as fs_ops, FsWatchRegistry};
 use crate::outgoing::OutgoingSender;
-use crate::sidecar::{SidecarClient, SidecarEvent, SidecarSessionOptions, TurnInput};
+use crate::sidecar::{
+    build_session_options, SidecarClient, SidecarEvent, SidecarSessionOptions, TurnInput,
+};
 use crate::thread_store::{ThreadStore, UnsubscribeStatus};
 use claude_app_server_protocol as proto;
 use proto::{
@@ -210,8 +212,15 @@ impl MessageProcessor {
             }
         };
         let model = p.model.unwrap_or_else(|| self.default_model.clone());
+        let customization: crate::thread_store::ThreadCustomization = p.sdk_options.into_iter().collect();
         let thread = self.store
-            .create(model, p.cwd, p.system_prompt, p.ephemeral.unwrap_or(false))
+            .create_with_customization(
+                model,
+                p.cwd,
+                p.system_prompt,
+                p.ephemeral.unwrap_or(false),
+                customization,
+            )
             .await;
         let result = ThreadStartResult { thread: thread.clone() };
         self.out.respond(id, &result).await;
@@ -365,19 +374,13 @@ impl MessageProcessor {
             }
         };
         if needs_create {
-            let model = p.model.clone().unwrap_or(stored.model.clone());
-            let system_prompt = p.system_prompt.clone().or(stored.system_prompt.clone());
-            let opts = SidecarSessionOptions {
-                cwd: p.cwd.clone().or(stored.cwd.clone()),
-                model: Some(model),
-                system_prompt: Some(system_prompt),
-                permission_mode: Some("bypassPermissions".into()),
-                allowed_tools: None,
-                disallowed_tools: None,
-                max_turns: None,
-                include_partial_messages: Some(true),
-                resume: None,
-            };
+            let opts = build_session_options_for(
+                &p.model.clone().or(Some(stored.model.clone())),
+                &p.cwd.clone().or(stored.cwd.clone()),
+                &p.system_prompt.clone().or(stored.system_prompt.clone()),
+                &stored.customization,
+                &p.sdk_options,
+            );
             if let Err(e) = self.sidecar.create_session(&p.thread_id, Some(opts)).await {
                 self.created_sessions.lock().await.remove(&p.thread_id);
                 self.out
@@ -1327,17 +1330,13 @@ impl MessageProcessor {
             }
         };
         if needs_create {
-            let opts = crate::sidecar::SidecarSessionOptions {
-                cwd: stored.cwd.clone(),
-                model: Some(stored.model.clone()),
-                system_prompt: Some(stored.system_prompt.clone()),
-                permission_mode: Some("bypassPermissions".into()),
-                allowed_tools: None,
-                disallowed_tools: None,
-                max_turns: Some(20),
-                include_partial_messages: Some(true),
-                resume: None,
-            };
+            let opts = build_session_options_for(
+                &Some(stored.model.clone()),
+                &stored.cwd.clone(),
+                &stored.system_prompt.clone(),
+                &stored.customization,
+                &std::collections::HashMap::new(),
+            );
             if let Err(e) = self.sidecar.create_session(&p.thread_id, Some(opts)).await {
                 tracing::warn!("review create_session failed: {e}");
                 return;
@@ -1352,6 +1351,43 @@ impl MessageProcessor {
             )
             .await;
     }
+}
+
+/// Compose a `SidecarSessionOptions` blob.
+///
+/// Layering (last write wins):
+///   1. ergonomic typed defaults (model, cwd, systemPrompt, permissionMode,
+///      includePartialMessages)
+///   2. the thread's stored customization (from `thread/start sdk_options`)
+///   3. the per-turn `sdk_options` map (from `turn/start sdk_options`)
+fn build_session_options_for(
+    model: &Option<String>,
+    cwd: &Option<String>,
+    system_prompt: &Option<String>,
+    thread_customization: &serde_json::Map<String, serde_json::Value>,
+    per_turn_overrides: &std::collections::HashMap<String, serde_json::Value>,
+) -> SidecarSessionOptions {
+    let mut typed: Vec<(&'static str, serde_json::Value)> = vec![
+        ("permissionMode", serde_json::Value::String("bypassPermissions".into())),
+        ("includePartialMessages", serde_json::Value::Bool(true)),
+    ];
+    if let Some(m) = model {
+        typed.push(("model", serde_json::Value::String(m.clone())));
+    }
+    if let Some(c) = cwd {
+        typed.push(("cwd", serde_json::Value::String(c.clone())));
+    }
+    if let Some(sp) = system_prompt {
+        typed.push(("systemPrompt", serde_json::Value::String(sp.clone())));
+    } else {
+        // `null` → sidecar uses the claude_code preset.
+        typed.push(("systemPrompt", serde_json::Value::Null));
+    }
+    let mut merged = build_session_options(typed, thread_customization.clone());
+    for (k, v) in per_turn_overrides {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
 }
 
 fn parse_usage(value: serde_json::Value) -> Option<proto::TokenUsage> {

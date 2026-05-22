@@ -76,6 +76,10 @@ function buildOptions(spec, abort) {
         disallowedTools: spec.disallowedTools,
         maxTurns: spec.maxTurns,
         resume: spec.resume,
+        additionalDirectories: spec.additionalDirectories,
+        env: spec.env,
+        mcpServers: spec.mcpServers,
+        agents: spec.agents,
     };
     if (spec.systemPrompt === null) {
         opts.systemPrompt = { type: "preset", preset: "claude_code" };
