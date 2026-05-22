@@ -123,29 +123,91 @@ against Codex can talk to this server with minimal changes:
 
 ### Supported methods
 
-| Method            | Notes                                                                  |
-|-------------------|------------------------------------------------------------------------|
-| `initialize`      | Handshake; must precede every other request on a connection.           |
-| `initialized`     | Notification acking the handshake.                                     |
-| `thread/start`    | Create a thread. Accepts `model`, `cwd`, `ephemeral`, `systemPrompt`.  |
-| `thread/resume`   | Reopen a thread by id; supports `excludeTurns`.                        |
-| `thread/fork`     | Branch a thread; `ephemeral` supported.                                |
-| `thread/list`     | In-memory list, sorted newest first.                                   |
-| `thread/read`     | Returns the stored thread; `includeTurns` controls history hydration.  |
-| `thread/archive`  | Drops the thread from in-memory store and closes its sidecar session.  |
-| `turn/start`      | Streams a turn through the Claude Agent SDK. Tools/MCP/skills/hooks work. |
-| `turn/interrupt`  | Aborts the in-flight turn via the sidecar's AbortController.           |
-| `model/list`      | Reports Opus 4.7, Sonnet 4.6, Haiku 4.5.                               |
+#### Lifecycle
+
+| Method        | Notes                                                          |
+|---------------|----------------------------------------------------------------|
+| `initialize`  | Handshake; must precede every other request on a connection.   |
+| `initialized` | Notification acking the handshake.                             |
+
+#### Threads
+
+| Method                 | Notes                                                                  |
+|------------------------|------------------------------------------------------------------------|
+| `thread/start`         | Create a thread. Accepts `model`, `cwd`, `ephemeral`, `systemPrompt`.  |
+| `thread/resume`        | Reopen a thread by id; supports `excludeTurns`.                        |
+| `thread/fork`          | Branch a thread; `ephemeral` supported.                                |
+| `thread/list`          | In-memory list, sorted newest first.                                   |
+| `thread/loaded/list`   | Ids of currently loaded threads.                                       |
+| `thread/read`          | Returns the stored thread; `includeTurns` hydrates history.            |
+| `thread/archive`       | Move thread out of the active set; emits `thread/archived`.            |
+| `thread/unarchive`     | Restore an archived thread; emits `thread/unarchived`.                 |
+| `thread/unsubscribe`   | Stop receiving events for a thread; emits `thread/closed`.             |
+| `thread/name/set`      | Rename a thread; emits `thread/name/updated`.                          |
+| `thread/inject_items`  | Push raw SDK user messages into a session's input stream.              |
+| `thread/compact/start` | Request manual context compaction.                                     |
+| `thread/goal/set`      | Create/update the persisted goal; emits `thread/goal/updated`.         |
+| `thread/goal/get`      | Read the current goal (`null` if none).                                |
+| `thread/goal/clear`    | Remove the goal; emits `thread/goal/cleared` if state changed.         |
+
+#### Turns
+
+| Method           | Notes                                                                   |
+|------------------|-------------------------------------------------------------------------|
+| `turn/start`     | Stream a turn through the Claude Agent SDK. Tools/MCP/skills/hooks work.|
+| `turn/interrupt` | Abort the in-flight turn via the sidecar's `AbortController`.           |
+| `turn/steer`     | Append additional user input to the active turn.                        |
+
+#### Models / config
+
+| Method        | Notes                                                                |
+|---------------|----------------------------------------------------------------------|
+| `model/list`  | Reports Opus 4.7, Sonnet 4.6, Haiku 4.5.                             |
+| `config/read` | Effective model, claude home, platform, current cwd.                 |
+
+#### Skills / hooks / MCP
+
+| Method                     | Notes                                                       |
+|----------------------------|-------------------------------------------------------------|
+| `skills/list`              | Discover `SKILL.md` files under `~/.claude/skills/`.        |
+| `hooks/list`               | Placeholder until the SDK exposes a hook discovery API.     |
+| `mcpServerStatus/list`     | Placeholder until the SDK exposes MCP status API.           |
+| `mcpServer/tool/call`      | Currently returns `-32601`; route through `turn/start`.     |
+
+#### Filesystem
+
+| Method                | Notes                                                                |
+|-----------------------|----------------------------------------------------------------------|
+| `fs/readFile`         | Return base64-encoded bytes for an absolute file path.               |
+| `fs/writeFile`        | Write base64-decoded bytes to an absolute path; parents auto-created.|
+| `fs/createDirectory`  | `recursive` defaults to `true`.                                      |
+| `fs/getMetadata`      | `isDirectory` / `isFile` / `isSymlink` / `createdAtMs` / `modifiedAtMs` / `sizeBytes`. |
+| `fs/readDirectory`    | Sorted child entries with `isDirectory` / `isFile`.                  |
+| `fs/remove`           | `recursive` / `force` default to `true`.                             |
+| `fs/copy`             | Files copy directly; directories require `recursive: true`.          |
+| `fs/watch`            | Cross-platform notify-backed watcher with `watchId`-keyed routing.   |
+| `fs/unwatch`          | Cancel a registered watcher.                                         |
+
+#### Command exec
+
+| Method                    | Notes                                                                   |
+|---------------------------|-------------------------------------------------------------------------|
+| `command/exec`            | Spawn argv, capture stdout/stderr/exit. Optional streaming via `processId` + `streamStdoutStderr`. |
+| `command/exec/write`      | Write base64 stdin to a running streaming process (or close stdin).     |
+| `command/exec/terminate`  | Kill a running streaming process.                                       |
+
+> `command/exec` is **unsandboxed**. Codex enforces a sandbox; we leave that to the host environment. Use only with trusted local UIs.
 
 ### Notifications emitted
 
-- `thread/started` after `thread/start`, `thread/resume`, `thread/fork`.
-- `thread/status/changed` whenever a thread transitions between `idle` and `active`.
-- `turn/started` immediately after `turn/start` accepts.
-- `item/started` / `item/completed` for assistant messages, tool uses, tool
-  results, reasoning.
-- `item/agentMessage/delta` for each streamed text chunk.
-- `turn/completed` with `tokenUsage`.
+- `thread/started`, `thread/archived`, `thread/unarchived`,
+  `thread/name/updated`, `thread/goal/updated`, `thread/goal/cleared`,
+  `thread/closed`.
+- `thread/status/changed` on idle/active transitions.
+- `turn/started`, `turn/completed` (with `tokenUsage`).
+- `item/started`, `item/completed`, `item/agentMessage/delta`.
+- `fs/changed` (per `watchId`).
+- `command/exec/outputDelta` (when `streamStdoutStderr: true`).
 
 ### Item kinds streamed
 
@@ -164,9 +226,8 @@ touching them gets `-32601 Method not supported`.
 |-----------------------------|-----------------------------------------------------------------|
 | websocket / unix-socket     | Only `--listen stdio://` is wired up.                           |
 | Persistence                 | Threads + rollouts are RAM-only and lost on restart.            |
-| `command/exec`, `process/spawn` | Not exposed — the Claude Agent SDK runs commands as tools instead. |
-| `fs/*`                      | Not implemented; the SDK exposes `Read` / `Write` / `Edit` tools. |
-| `mcpServer*` direct calls   | Not implemented; configure MCP servers via SDK options instead. |
+| `process/spawn` / PTY exec  | Use `command/exec`. PTY mode + Windows sandbox not implemented. |
+| `mcpServer*` rich queries   | Stub responses; SDK does not currently expose MCP status APIs.  |
 | `marketplace/*`, `plugin/*` | No plugin/marketplace concept.                                  |
 | `review/start`              | No automated reviewer pipeline.                                 |
 | `thread/realtime/*`         | No realtime / WebRTC bridge.                                    |
@@ -247,48 +308,8 @@ initialize handshake before sending other requests.)
   environments without outbound HTTP need `CLAUDE_APP_SERVER_RELEASE_URL`
   pointing at a mirror or `npm run build` from a source checkout.
 
-## Publishing (maintainers)
+## Contributing / releasing
 
-End-to-end release is a single command:
-
-```bash
-npm run release patch          # 0.1.0 -> 0.1.1
-npm run release minor          # 0.1.0 -> 0.2.0
-npm run release major          # 0.1.0 -> 1.0.0
-```
-
-What this does locally: cleanliness check, version bump, git tag, push.
-
-What GitHub Actions does once the tag lands
-(`.github/workflows/release.yml`):
-
-1. matrix-builds the Rust binary for `darwin-arm64`, `darwin-x64`,
-   `linux-x64`, `linux-arm64`,
-2. builds the TypeScript sidecar on a Linux runner,
-3. assembles `dist/sidecar/` + `dist/bin/<triple>/` on a single publish
-   job,
-4. creates a GitHub Release with per-platform tarballs attached,
-5. runs `npm publish --access public` against `@renkoya1/claude-app-server`.
-
-Prerequisites — these are one-time configuration on the GitHub
-repository:
-
-- `NPM_TOKEN` repository secret — a granular token with publish rights
-  to `@renkoya1/claude-app-server` (https://www.npmjs.com/settings/renkoya1/tokens).
-- Default `GITHUB_TOKEN` (no setup needed) — used by `gh release create`.
-
-If you want to ship a one-platform build from your laptop without going
-through CI (useful for dogfooding only):
-
-```bash
-npm run release patch -- --local
-```
-
-That bumps the version, builds the current platform, runs `npm publish`
-directly, and then pushes the tag.
-
-To preview the release flow without taking any action:
-
-```bash
-npm run release patch -- --dry-run
-```
+Maintainer-only release notes live in [`RELEASING.md`](RELEASING.md).
+Contributor build instructions are in the *Build from source* section
+above.
