@@ -35,7 +35,6 @@ pub mod request {
     // MCP
     pub const MCP_SERVER_STATUS_LIST: &str = "mcpServerStatus/list";
     pub const MCP_SERVER_TOOL_CALL: &str = "mcpServer/tool/call";
-    pub const MCP_SERVER_RESOURCE_READ: &str = "mcpServer/resource/read";
 
     // Skills / hooks
     pub const SKILLS_LIST: &str = "skills/list";
@@ -76,6 +75,25 @@ pub mod request {
 
     // Review
     pub const REVIEW_START: &str = "review/start";
+
+    // --- Account (Claude Agent SDK Query.accountInfo()) ---------------
+    pub const ACCOUNT_READ: &str = "account/read";
+
+    // --- Bridge responses (client → server, fulfills a permissionRequest/hook event) ---
+    pub const PERMISSION_RESPOND: &str = "permission/respond";
+    pub const HOOK_RESPOND: &str = "hook/respond";
+
+    // --- Agent registry (client-defined subagent for the Task tool) ---
+    pub const AGENT_DEFINE: &str = "agent/define";
+    pub const AGENT_LIST: &str = "agent/list";
+    pub const AGENT_REMOVE: &str = "agent/remove";
+
+    // --- MCP runtime steering -----------------------------------------
+    pub const MCP_SERVERS_SET: &str = "mcpServer/set";
+
+    // --- Per-thread runtime steering via Query.setX -------------------
+    pub const THREAD_MODEL_SET: &str = "thread/model/set";
+    pub const THREAD_MAX_THINKING_TOKENS_SET: &str = "thread/maxThinkingTokens/set";
 }
 
 pub mod notification {
@@ -111,4 +129,32 @@ pub mod notification {
     pub const THREAD_METADATA_UPDATED: &str = "thread/metadata/updated";
     pub const THREAD_SETTINGS_UPDATED: &str = "thread/settings/updated";
     pub const THREAD_MEMORY_MODE_CHANGED: &str = "thread/memoryMode/changed";
+
+    // --- SDK richer event surface -------------------------------------
+    /// SDK loop initialized; carries tool/mcp/agent inventory.
+    pub const THREAD_SESSION_INIT: &str = "thread/session/init";
+    /// `item/reasoning/textDelta` — thinking-block stream delta.
+    pub const ITEM_REASONING_TEXT_DELTA: &str = "item/reasoning/textDelta";
+    /// Cumulative token usage updated mid-turn.
+    pub const THREAD_TOKEN_USAGE_UPDATED: &str = "thread/tokenUsage/updated";
+    /// SDK context compaction crossed a boundary.
+    pub const THREAD_COMPACTED: &str = "thread/compacted";
+    /// SDK rerouted from primary model to `fallbackModel`.
+    pub const MODEL_REROUTED: &str = "model/rerouted";
+    /// `hook/started` and `hook/completed` — SDK hook lifecycle.
+    pub const HOOK_STARTED: &str = "hook/started";
+    pub const HOOK_COMPLETED: &str = "hook/completed";
+
+    // --- canUseTool bridge: server-initiated approval requests --------
+    /// Item-level approval requests. Carries a `requestId` and a
+    /// description of the tool call. The client must reply by calling
+    /// the `permission/respond` request with the same `requestId`.
+    pub const ITEM_COMMAND_EXECUTION_REQUEST_APPROVAL: &str = "item/commandExecution/requestApproval";
+    pub const ITEM_FILE_CHANGE_REQUEST_APPROVAL: &str = "item/fileChange/requestApproval";
+    pub const ITEM_PERMISSIONS_REQUEST_APPROVAL: &str = "item/permissions/requestApproval";
+    pub const ITEM_TOOL_REQUEST_USER_INPUT: &str = "item/tool/requestUserInput";
+    pub const MCP_SERVER_ELICITATION_REQUEST: &str = "mcpServer/elicitation/request";
+
+    // --- Account ------------------------------------------------------
+    pub const ACCOUNT_UPDATED: &str = "account/updated";
 }

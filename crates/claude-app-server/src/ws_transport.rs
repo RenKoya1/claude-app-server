@@ -94,6 +94,10 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         state.default_model.clone(),
         state.store.clone(),
     ));
+    // Each ws connection runs its own ambient listener so it sees the
+    // hook/permission/reasoning/sessionInit/etc. events its own threads
+    // generate.
+    processor.spawn_ambient_listener();
 
     // Writer task: drain outbound messages into the websocket sink.
     let write_task = tokio::spawn(async move {

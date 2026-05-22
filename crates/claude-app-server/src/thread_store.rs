@@ -393,6 +393,64 @@ impl ThreadStore {
         Some(stored.settings.clone())
     }
 
+    /// Insert / replace a single key in a thread's SDK customization
+    /// blob. Used by `agent/define`, `mcpServer/set`, runtime model
+    /// changes, etc., so the next session create picks the new value up
+    /// without having to round-trip through `thread/start sdk_options`.
+    pub async fn upsert_customization_key(
+        &self,
+        thread_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> bool {
+        let mut guard = self.inner.lock().await;
+        let Some(stored) = guard.threads.get_mut(thread_id) else { return false; };
+        stored.customization.insert(key.to_string(), value);
+        stored.thread.updated_at = Some(Utc::now().timestamp());
+        true
+    }
+
+    /// Add or replace one entry in the thread's `agents` customization
+    /// map. The SDK reads the whole map at session create time, so any
+    /// already-live session must be recreated for the new agent to take
+    /// effect. The processor handles the recreate cycle.
+    pub async fn upsert_agent(
+        &self,
+        thread_id: &str,
+        name: &str,
+        agent_json: serde_json::Value,
+    ) -> bool {
+        let mut guard = self.inner.lock().await;
+        let Some(stored) = guard.threads.get_mut(thread_id) else { return false; };
+        let map = stored
+            .customization
+            .entry("agents".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        match map {
+            serde_json::Value::Object(obj) => {
+                obj.insert(name.to_string(), agent_json);
+            }
+            _ => {
+                let mut obj = serde_json::Map::new();
+                obj.insert(name.to_string(), agent_json);
+                *map = serde_json::Value::Object(obj);
+            }
+        }
+        stored.thread.updated_at = Some(Utc::now().timestamp());
+        true
+    }
+
+    pub async fn remove_agent(&self, thread_id: &str, name: &str) -> bool {
+        let mut guard = self.inner.lock().await;
+        let Some(stored) = guard.threads.get_mut(thread_id) else { return false; };
+        let Some(serde_json::Value::Object(obj)) = stored.customization.get_mut("agents") else {
+            return false;
+        };
+        let removed = obj.remove(name).is_some();
+        stored.thread.updated_at = Some(Utc::now().timestamp());
+        removed
+    }
+
     pub async fn set_memory_mode(&self, thread_id: &str, mode: String) -> bool {
         let mut guard = self.inner.lock().await;
         if let Some(stored) = guard.threads.get_mut(thread_id) {

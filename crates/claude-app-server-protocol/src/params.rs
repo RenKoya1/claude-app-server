@@ -373,15 +373,6 @@ pub struct McpServerToolCallParams {
     pub arguments: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpServerResourceReadParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_id: Option<String>,
-    pub server: String,
-    pub uri: String,
-}
-
 // --- Filesystem -----------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -749,3 +740,254 @@ pub struct ReviewStartResult {
     pub review_thread_id: String,
 }
 
+// --- Account --------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountReadParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountReadResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_source: Option<String>,
+}
+
+// --- canUseTool bridge: client → server permission response --------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRespondParams {
+    pub request_id: String,
+    pub decision: PermissionRespondDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "behavior", rename_all = "camelCase")]
+pub enum PermissionRespondDecision {
+    #[serde(rename_all = "camelCase")]
+    Allow {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_permissions: Option<serde_json::Value>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Deny {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupt: Option<bool>,
+    },
+}
+
+// --- Hook bridge: client → server hook response --------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookRespondParams {
+    pub request_id: String,
+    /// Verbatim `HookJSONOutput` JSON shape (the SDK validates it).
+    pub output: serde_json::Value,
+}
+
+// --- Server-initiated approval requests ---------------------------------
+
+/// Sent as a server → client *notification* (not request) carrying the
+/// reqId. The client must reply by issuing a `permission/respond` request
+/// with the matching reqId. We use notification + follow-up rather than
+/// true bidirectional JSON-RPC requests to keep the wire protocol simple.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestApprovalNotification {
+    pub request_id: String,
+    pub session_id: String,
+    pub tool_name: String,
+    pub tool_use_id: String,
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+// --- Hook lifecycle notifications ---------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookStartedEvent {
+    pub thread_id: String,
+    pub request_id: String,
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    pub payload: serde_json::Value,
+    /// When true, the SDK is blocked on a `hook/respond` from the client.
+    pub expect_response: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookCompletedEvent {
+    pub thread_id: String,
+    pub request_id: String,
+    pub event: String,
+    pub output: serde_json::Value,
+}
+
+// --- Token usage delta ---------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTokenUsageUpdatedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub usage: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_usage: Option<serde_json::Value>,
+}
+
+// --- Reasoning delta -----------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemReasoningTextDeltaEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub delta: String,
+}
+
+// --- Compact + reroute ---------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadCompactedEvent {
+    pub thread_id: String,
+    pub trigger: String,
+    pub pre_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReroutedEvent {
+    pub thread_id: String,
+    pub reason: String,
+}
+
+// --- SDK session init ---------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSessionInitEvent {
+    pub thread_id: String,
+    pub sdk_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slash_commands: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_version: Option<String>,
+}
+
+// --- Agent registry ------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDefinition {
+    pub name: String,
+    pub description: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disallowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDefineParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub agent: AgentDefinition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRemoveParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentListResult {
+    pub data: Vec<AgentDefinition>,
+}
+
+// --- MCP runtime steering ----------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServersSetParams {
+    pub thread_id: String,
+    /// `Record<string, McpServerConfig>` shape — same as SDK
+    /// `Query.setMcpServers()` argument.
+    pub servers: serde_json::Value,
+}
+
+// --- Per-thread runtime model + thinking-token steering ----------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModelSetParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMaxThinkingTokensSetParams {
+    pub thread_id: String,
+    /// `null` → reset to SDK default.
+    pub max_thinking_tokens: Option<i64>,
+}

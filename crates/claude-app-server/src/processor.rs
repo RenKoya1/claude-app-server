@@ -143,9 +143,7 @@ impl MessageProcessor {
             // v0.4.0 additions
             proto::request::THREAD_TURNS_LIST => self.handle_thread_turns_list(id, params).await,
             proto::request::THREAD_TURNS_ITEMS_LIST => {
-                self.out
-                    .error(id, proto::METHOD_NOT_FOUND, "thread/turns/items/list is not supported yet")
-                    .await
+                self.handle_thread_turns_items_list(id, params).await
             }
             proto::request::THREAD_METADATA_UPDATE => self.handle_thread_metadata_update(id, params).await,
             proto::request::THREAD_SETTINGS_UPDATE => self.handle_thread_settings_update(id, params).await,
@@ -163,6 +161,27 @@ impl MessageProcessor {
                 self.handle_model_provider_capabilities(id).await
             }
             proto::request::REVIEW_START => self.handle_review_start(id, params).await,
+
+            // --- Account -------------------------------------------------
+            proto::request::ACCOUNT_READ => self.handle_account_read(id, params).await,
+
+            // --- canUseTool / hook bridge responses ---------------------
+            proto::request::PERMISSION_RESPOND => self.handle_permission_respond(id, params).await,
+            proto::request::HOOK_RESPOND => self.handle_hook_respond(id, params).await,
+
+            // --- Agent registry -----------------------------------------
+            proto::request::AGENT_DEFINE => self.handle_agent_define(id, params).await,
+            proto::request::AGENT_LIST => self.handle_agent_list(id, params).await,
+            proto::request::AGENT_REMOVE => self.handle_agent_remove(id, params).await,
+
+            // --- MCP runtime steering -----------------------------------
+            proto::request::MCP_SERVERS_SET => self.handle_mcp_servers_set(id, params).await,
+
+            // --- Per-thread runtime model + thinking-token steering -----
+            proto::request::THREAD_MODEL_SET => self.handle_thread_model_set(id, params).await,
+            proto::request::THREAD_MAX_THINKING_TOKENS_SET => {
+                self.handle_thread_max_thinking_tokens_set(id, params).await
+            }
 
             other => {
                 self.out
@@ -318,6 +337,35 @@ impl MessageProcessor {
     }
 
     async fn handle_model_list(&self, id: proto::RequestId) {
+        // Prefer the live SDK list (Query.supportedModels()). Pick any live
+        // session — model list is global. Fall back to a hardcoded list if
+        // no session is open yet.
+        let live_session_id = self.created_sessions.lock().await.iter().next().cloned();
+        if let Some(sid) = live_session_id {
+            if let Ok(value) = self.sidecar.supported_models(&sid).await {
+                if let Some(arr) = value.get("data").and_then(|v| v.as_array()) {
+                    let data: Vec<ModelDescriptor> = arr
+                        .iter()
+                        .filter_map(|m| {
+                            let value = m.get("value").and_then(|v| v.as_str())?;
+                            let display = m
+                                .get("displayName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(value);
+                            Some(ModelDescriptor {
+                                id: value.to_string(),
+                                display_name: display.to_string(),
+                                hidden: false,
+                            })
+                        })
+                        .collect();
+                    if !data.is_empty() {
+                        self.out.respond(id, &ModelListResult { data }).await;
+                        return;
+                    }
+                }
+            }
+        }
         let data = vec![
             ModelDescriptor {
                 id: "claude-opus-4-7".into(),
@@ -817,6 +865,16 @@ impl MessageProcessor {
     }
 
     async fn handle_mcp_status_list(self: Arc<Self>, id: proto::RequestId) {
+        // Prefer Query.mcpServerStatus() against any live session for a
+        // truthful snapshot of connection state. Falls back to the
+        // sidecar's stateless aggregation (also Query-driven internally).
+        let sid = self.created_sessions.lock().await.iter().next().cloned();
+        if let Some(sid) = sid {
+            if let Ok(value) = self.sidecar.mcp_server_status(&sid).await {
+                self.out.raw_response(id, value).await;
+                return;
+            }
+        }
         match self.sidecar.list_mcp_servers(None).await {
             Ok(value) => self.out.raw_response(id, value).await,
             Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
@@ -1059,10 +1117,28 @@ impl MessageProcessor {
             Ok(v) => v,
             Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
         };
+        let settings_clone = p.settings.clone();
         let Some(settings) = self.store.update_settings(&p.thread_id, p.settings).await else {
             self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
             return;
         };
+        // If a sidecar session is live, push the runtime-mutable subset
+        // through Query.setX so it takes effect mid-session without
+        // forcing a fork. Stored value is the source of truth on the
+        // next recreate.
+        let live = self.created_sessions.lock().await.contains(&p.thread_id);
+        if live {
+            if let Some(m) = settings_clone.model.clone() {
+                if let Err(e) = self.sidecar.set_model(&p.thread_id, Some(m)).await {
+                    warn!("setModel runtime apply failed: {e}");
+                }
+            }
+            if let Some(pm) = settings_clone.permission_mode.clone() {
+                if let Err(e) = self.sidecar.set_permission_mode(&p.thread_id, &pm).await {
+                    warn!("setPermissionMode runtime apply failed: {e}");
+                }
+            }
+        }
         self.out.respond_empty(id).await;
         self.out
             .notify(
@@ -1077,11 +1153,35 @@ impl MessageProcessor {
             Ok(v) => v,
             Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
         };
+        // Always update the in-memory turn array.
         let Some(thread) = self.store.rollback(&p.thread_id, p.turns).await else {
             self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
             return;
         };
-        self.out.respond(id, &serde_json::json!({ "thread": thread })).await;
+        // If file checkpointing is enabled for this thread, also rewind
+        // the on-disk state via the SDK. We rewind to the *target* user
+        // message — the one that became the latest after truncation.
+        let live = self.created_sessions.lock().await.contains(&p.thread_id);
+        let mut rewound: Option<serde_json::Value> = None;
+        if live {
+            if let Some(target_turn) = thread.turns.last() {
+                let target_msg_id = target_turn.id.clone();
+                match self
+                    .sidecar
+                    .rewind_files(&p.thread_id, &target_msg_id, None)
+                    .await
+                {
+                    Ok(v) => rewound = Some(v),
+                    Err(e) => warn!("rewindFiles failed: {e}"),
+                }
+            }
+        }
+        let payload = if let Some(r) = rewound {
+            serde_json::json!({ "thread": thread, "rewindFiles": r })
+        } else {
+            serde_json::json!({ "thread": thread })
+        };
+        self.out.respond(id, &payload).await;
     }
 
     async fn handle_thread_shell_command(self: Arc<Self>, id: proto::RequestId, params: serde_json::Value) {
@@ -1206,12 +1306,12 @@ impl MessageProcessor {
                 description: Some("Plan-only mode; no tool execution.".into()),
             },
             proto::PermissionProfileDescriptor {
-                id: "delegate".into(),
-                description: Some("Delegate to a subagent's permission decision.".into()),
-            },
-            proto::PermissionProfileDescriptor {
                 id: "dontAsk".into(),
                 description: Some("Never ask the user; deny anything not pre-approved.".into()),
+            },
+            proto::PermissionProfileDescriptor {
+                id: "auto".into(),
+                description: Some("SDK 0.3+: let the agent self-route permission decisions.".into()),
             },
         ];
         self.out.respond(id, &proto::PermissionProfileListResult { data }).await;
@@ -1350,6 +1450,369 @@ impl MessageProcessor {
                 vec![crate::sidecar::TurnInput::Text { text: prompt }],
             )
             .await;
+    }
+
+    // --- thread/turns/items/list -------------------------------------
+
+    async fn handle_thread_turns_items_list(&self, id: proto::RequestId, params: serde_json::Value) {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Params {
+            thread_id: String,
+            turn_id: String,
+            #[serde(default)] cursor: Option<String>,
+            #[serde(default)] limit: Option<u32>,
+            #[serde(default)] sort_direction: Option<String>,
+        }
+        let p: Params = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(stored) = self.store.get(&p.thread_id).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        let Some(turn) = stored.turns.iter().find(|t| t.id == p.turn_id) else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Turn not found").await;
+            return;
+        };
+        let descending = p.sort_direction.as_deref() != Some("asc");
+        let limit = p.limit.unwrap_or(50).max(1) as usize;
+        let offset = p.cursor.as_deref().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        let mut items = turn.items.clone();
+        if descending { items.reverse(); }
+        let total = items.len();
+        let end = (offset + limit).min(total);
+        let slice = if offset < total { items[offset..end].to_vec() } else { vec![] };
+        let next_cursor = if end < total { Some(end.to_string()) } else { None };
+        let backwards_cursor = if offset > 0 { Some(offset.to_string()) } else { None };
+        let payload = serde_json::json!({
+            "data": slice,
+            "nextCursor": next_cursor,
+            "backwardsCursor": backwards_cursor,
+        });
+        self.out.respond(id, &payload).await;
+    }
+
+    // --- Account ----------------------------------------------------
+
+    async fn handle_account_read(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::AccountReadParams = serde_json::from_value(params).unwrap_or_default();
+        // Need a live session to call Query.accountInfo(). Pick the
+        // requested thread, or fall back to any.
+        let sid = match p.thread_id {
+            Some(t) if self.created_sessions.lock().await.contains(&t) => Some(t),
+            _ => self.created_sessions.lock().await.iter().next().cloned(),
+        };
+        let Some(sid) = sid else {
+            self.out
+                .error(id, proto::INTERNAL_ERROR, "no live SDK session; start a thread+turn first")
+                .await;
+            return;
+        };
+        match self.sidecar.account_info(&sid).await {
+            Ok(value) => self.out.raw_response(id, value).await,
+            Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+        }
+    }
+
+    // --- canUseTool / hook bridge responses -------------------------
+
+    async fn handle_permission_respond(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::PermissionRespondParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let result = serde_json::to_value(&p.decision).unwrap_or(serde_json::json!({}));
+        match self.sidecar.permission_response(&p.request_id, result).await {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+        }
+    }
+
+    async fn handle_hook_respond(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::HookRespondParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        match self.sidecar.hook_response(&p.request_id, p.output).await {
+            Ok(()) => self.out.respond_empty(id).await,
+            Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+        }
+    }
+
+    // --- Agent registry ---------------------------------------------
+
+    /// Agents are stored in the thread's customization map under the
+    /// `agents` key in the shape `Record<string, AgentDefinition>` —
+    /// exactly what the SDK's `Options.agents` accepts. On the next
+    /// session create, `build_session_options_for` forwards the whole
+    /// customization blob, so the SDK sees them automatically. If a
+    /// session is already live, we close it so the next turn picks up
+    /// the new agent inventory.
+    async fn handle_agent_define(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::AgentDefineParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(tid) = p.thread_id else {
+            self.out.error(id, proto::INVALID_PARAMS, "threadId is required").await;
+            return;
+        };
+        let agent_json = match serde_json::to_value(&p.agent) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await; return; }
+        };
+        if !self
+            .store
+            .upsert_agent(&tid, &p.agent.name, agent_json)
+            .await
+        {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        }
+        self.maybe_recreate_session(&tid).await;
+        self.out.respond_empty(id).await;
+    }
+
+    async fn handle_agent_list(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::AgentListParams = serde_json::from_value(params).unwrap_or_default();
+        let Some(tid) = p.thread_id else {
+            self.out.error(id, proto::INVALID_PARAMS, "threadId is required").await;
+            return;
+        };
+        let Some(stored) = self.store.get(&tid).await else {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread not found").await;
+            return;
+        };
+        let mut data: Vec<proto::AgentDefinition> = vec![];
+        if let Some(agents) = stored.customization.get("agents").and_then(|v| v.as_object()) {
+            for (name, def) in agents {
+                if let Ok(mut a) = serde_json::from_value::<proto::AgentDefinition>(def.clone()) {
+                    a.name = name.clone();
+                    data.push(a);
+                }
+            }
+        }
+        self.out
+            .respond(id, &proto::AgentListResult { data })
+            .await;
+    }
+
+    async fn handle_agent_remove(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::AgentRemoveParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let Some(tid) = p.thread_id else {
+            self.out.error(id, proto::INVALID_PARAMS, "threadId is required").await;
+            return;
+        };
+        if !self.store.remove_agent(&tid, &p.name).await {
+            self.out.error(id, proto::INTERNAL_ERROR, "Thread or agent not found").await;
+            return;
+        }
+        self.maybe_recreate_session(&tid).await;
+        self.out.respond_empty(id).await;
+    }
+
+    /// Close any live sidecar session for a thread so the next turn
+    /// recreates it with the latest customization (agents, mcpServers,
+    /// hooks, etc).
+    async fn maybe_recreate_session(&self, thread_id: &str) {
+        if self.created_sessions.lock().await.remove(thread_id) {
+            if let Err(e) = self.sidecar.close_session(thread_id).await {
+                warn!("close_session for recreate failed: {e}");
+            }
+        }
+    }
+
+    // --- MCP runtime steering ---------------------------------------
+
+    async fn handle_mcp_servers_set(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::McpServersSetParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        // Persist into customization so the next session uses it.
+        let _ = self
+            .store
+            .upsert_customization_key(&p.thread_id, "mcpServers", p.servers.clone())
+            .await;
+        // Apply to the live session if any.
+        let live = self.created_sessions.lock().await.contains(&p.thread_id);
+        if live {
+            match self.sidecar.set_mcp_servers(&p.thread_id, p.servers).await {
+                Ok(value) => self.out.raw_response(id, value).await,
+                Err(e) => self.out.error(id, proto::INTERNAL_ERROR, format!("{e}")).await,
+            }
+        } else {
+            self.out
+                .respond(id, &serde_json::json!({ "added": [], "removed": [], "errors": {} }))
+                .await;
+        }
+    }
+
+    // --- Per-thread runtime model / max thinking tokens -------------
+
+    async fn handle_thread_model_set(&self, id: proto::RequestId, params: serde_json::Value) {
+        let p: proto::ThreadModelSetParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let live = self.created_sessions.lock().await.contains(&p.thread_id);
+        if live {
+            if let Err(e) = self.sidecar.set_model(&p.thread_id, p.model.clone()).await {
+                self.out.error(id, proto::INTERNAL_ERROR, format!("setModel: {e}")).await;
+                return;
+            }
+        }
+        // Mirror into stored settings so a subsequent recreate keeps the value.
+        let patch = claude_app_server_protocol::ThreadSettings {
+            model: p.model.clone(),
+            ..Default::default()
+        };
+        let _ = self.store.update_settings(&p.thread_id, patch).await;
+        self.out.respond_empty(id).await;
+    }
+
+    async fn handle_thread_max_thinking_tokens_set(
+        &self,
+        id: proto::RequestId,
+        params: serde_json::Value,
+    ) {
+        let p: proto::ThreadMaxThinkingTokensSetParams = match serde_json::from_value(params) {
+            Ok(v) => v,
+            Err(e) => { self.out.error(id, proto::INVALID_PARAMS, format!("{e}")).await; return; }
+        };
+        let live = self.created_sessions.lock().await.contains(&p.thread_id);
+        if live {
+            if let Err(e) = self
+                .sidecar
+                .set_max_thinking_tokens(&p.thread_id, p.max_thinking_tokens)
+                .await
+            {
+                self.out
+                    .error(id, proto::INTERNAL_ERROR, format!("setMaxThinkingTokens: {e}"))
+                    .await;
+                return;
+            }
+        }
+        // Mirror into customization for the next recreate.
+        let value = match p.max_thinking_tokens {
+            Some(n) => serde_json::Value::Number(serde_json::Number::from(n)),
+            None => serde_json::Value::Null,
+        };
+        let _ = self
+            .store
+            .upsert_customization_key(&p.thread_id, "maxThinkingTokens", value)
+            .await;
+        self.out.respond_empty(id).await;
+    }
+
+    // --- Ambient event listener -------------------------------------
+
+    /// Subscribe to the sidecar broadcast channel and translate the
+    /// non-turn-scoped events into protocol notifications. Turn-scoped
+    /// events (assistant text/tool use/tool result/etc.) keep being
+    /// handled per-turn in `handle_turn_start` — this listener only
+    /// catches the "ambient" stream (sessionInit, reasoning deltas,
+    /// token usage deltas, compact boundary, model reroute, hook
+    /// lifecycle, canUseTool approval requests).
+    pub fn spawn_ambient_listener(self: &Arc<Self>) {
+        let mut events = self.sidecar.subscribe();
+        let out = self.out.clone();
+        tokio::spawn(async move {
+            loop {
+                let event = match events.recv().await {
+                    Ok(e) => e,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("ambient sidecar subscriber lagged by {n}");
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                match event {
+                    SidecarEvent::SessionInit {
+                        session_id, sdk_session_id, model, tools, mcp_servers,
+                        slash_commands, skills, agents, permission_mode, cwd,
+                        claude_code_version,
+                    } => {
+                        let mcp_value = mcp_servers.map(|v| serde_json::Value::Array(v));
+                        let ev = proto::ThreadSessionInitEvent {
+                            thread_id: session_id,
+                            sdk_session_id,
+                            model, tools,
+                            mcp_servers: mcp_value,
+                            slash_commands, skills, agents,
+                            permission_mode, cwd, claude_code_version,
+                        };
+                        out.notify(proto::notification::THREAD_SESSION_INIT, &ev).await;
+                    }
+                    SidecarEvent::ReasoningDelta { session_id, turn_id, item_id, delta } => {
+                        let ev = proto::ItemReasoningTextDeltaEvent {
+                            thread_id: session_id, turn_id, item_id, delta,
+                        };
+                        out.notify(proto::notification::ITEM_REASONING_TEXT_DELTA, &ev).await;
+                    }
+                    SidecarEvent::TokenUsageUpdated { session_id, turn_id, usage, model_usage } => {
+                        let ev = proto::ThreadTokenUsageUpdatedEvent {
+                            thread_id: session_id, turn_id, usage, model_usage,
+                        };
+                        out.notify(proto::notification::THREAD_TOKEN_USAGE_UPDATED, &ev).await;
+                    }
+                    SidecarEvent::CompactBoundary { session_id, trigger, pre_tokens } => {
+                        let ev = proto::ThreadCompactedEvent {
+                            thread_id: session_id, trigger, pre_tokens,
+                        };
+                        out.notify(proto::notification::THREAD_COMPACTED, &ev).await;
+                    }
+                    SidecarEvent::ModelRerouted { session_id, reason } => {
+                        let ev = proto::ModelReroutedEvent { thread_id: session_id, reason };
+                        out.notify(proto::notification::MODEL_REROUTED, &ev).await;
+                    }
+                    SidecarEvent::HookEvent {
+                        session_id, request_id, event, tool_use_id, payload, expect_response,
+                    } => {
+                        let ev = proto::HookStartedEvent {
+                            thread_id: session_id, request_id, event, tool_use_id,
+                            payload, expect_response,
+                        };
+                        out.notify(proto::notification::HOOK_STARTED, &ev).await;
+                    }
+                    SidecarEvent::PermissionRequest {
+                        session_id, request_id, tool_name, tool_use_id, input,
+                        suggestions, blocked_path, decision_reason, agent_id,
+                    } => {
+                        let method = approval_method_for(&tool_name);
+                        let ev = proto::RequestApprovalNotification {
+                            request_id,
+                            session_id,
+                            tool_name,
+                            tool_use_id,
+                            input,
+                            suggestions,
+                            blocked_path,
+                            decision_reason,
+                            agent_id,
+                        };
+                        out.notify(method, &ev).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+/// Pick the codex-compatible approval method name for a given tool. The
+/// client UX may render different surfaces for command vs. file change
+/// vs. generic tool approvals.
+fn approval_method_for(tool_name: &str) -> &'static str {
+    match tool_name {
+        "Bash" | "BashOutput" | "KillShell" => proto::notification::ITEM_COMMAND_EXECUTION_REQUEST_APPROVAL,
+        "Edit" | "Write" | "NotebookEdit" | "MultiEdit" => proto::notification::ITEM_FILE_CHANGE_REQUEST_APPROVAL,
+        _ => proto::notification::ITEM_TOOL_REQUEST_USER_INPUT,
     }
 }
 

@@ -91,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
         default_model,
         store,
     ));
+    // Pump sidecar-originated ambient events (hooks, canUseTool, reasoning
+    // deltas, token usage, compact boundaries, model reroutes, sessionInit)
+    // into protocol notifications independently of any active turn.
+    processor.spawn_ambient_listener();
 
     let mut incoming = transport.incoming;
     while let Some(msg) = incoming.recv().await {

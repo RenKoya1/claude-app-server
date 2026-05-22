@@ -68,6 +68,62 @@ enum OutboundCommand {
     Compact { id: String, session_id: String },
     #[serde(rename_all = "camelCase")]
     CloseSession { id: String, session_id: String },
+    // --- Query control (runtime steering of a live session) ---
+    #[serde(rename_all = "camelCase")]
+    SetModel {
+        id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    SetPermissionMode {
+        id: String,
+        session_id: String,
+        mode: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    SetMaxThinkingTokens {
+        id: String,
+        session_id: String,
+        max_thinking_tokens: Option<i64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    SetMcpServers {
+        id: String,
+        session_id: String,
+        servers: Value,
+    },
+    #[serde(rename_all = "camelCase")]
+    RewindFiles {
+        id: String,
+        session_id: String,
+        user_message_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dry_run: Option<bool>,
+    },
+    #[serde(rename_all = "camelCase")]
+    SupportedCommands { id: String, session_id: String },
+    #[serde(rename_all = "camelCase")]
+    SupportedModels { id: String, session_id: String },
+    #[serde(rename_all = "camelCase")]
+    McpServerStatus { id: String, session_id: String },
+    #[serde(rename_all = "camelCase")]
+    AccountInfo { id: String, session_id: String },
+    // --- Bridge responses (Rust → sidecar reply to a bridge event) ---
+    #[serde(rename_all = "camelCase")]
+    PermissionResponse {
+        id: String,
+        request_id: String,
+        result: Value,
+    },
+    #[serde(rename_all = "camelCase")]
+    HookResponse {
+        id: String,
+        request_id: String,
+        output: Value,
+    },
+    // --- Legacy enumeration helpers ---
     #[serde(rename_all = "camelCase")]
     ListSkills { id: String, #[serde(skip_serializing_if = "Vec::is_empty")] cwds: Vec<String> },
     #[serde(rename_all = "camelCase")]
@@ -154,6 +210,23 @@ pub enum SidecarEvent {
     Log { level: String, msg: String },
     #[serde(rename_all = "camelCase")]
     SessionReady { session_id: String },
+    /// First message after the SDK loop initializes. Carries the SDK session
+    /// id plus the discovered tool/mcp/skill/agent inventory so clients can
+    /// render UI state without an extra round-trip.
+    #[serde(rename_all = "camelCase")]
+    SessionInit {
+        session_id: String,
+        sdk_session_id: String,
+        #[serde(default)] model: Option<String>,
+        #[serde(default)] tools: Option<Vec<String>>,
+        #[serde(default)] mcp_servers: Option<Vec<Value>>,
+        #[serde(default)] slash_commands: Option<Vec<String>>,
+        #[serde(default)] skills: Option<Vec<String>>,
+        #[serde(default)] agents: Option<Vec<String>>,
+        #[serde(default)] permission_mode: Option<String>,
+        #[serde(default)] cwd: Option<String>,
+        #[serde(default)] claude_code_version: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     SessionClosed { session_id: String, #[serde(default)] reason: Option<String> },
     #[serde(rename_all = "camelCase")]
@@ -181,6 +254,49 @@ pub enum SidecarEvent {
     #[serde(rename_all = "camelCase")]
     Reasoning { session_id: String, turn_id: String, item_id: String, text: String },
     #[serde(rename_all = "camelCase")]
+    ReasoningDelta { session_id: String, turn_id: String, item_id: String, delta: String },
+    #[serde(rename_all = "camelCase")]
+    TokenUsageUpdated {
+        session_id: String,
+        turn_id: String,
+        usage: Value,
+        #[serde(default)] model_usage: Option<Value>,
+    },
+    #[serde(rename_all = "camelCase")]
+    CompactBoundary {
+        session_id: String,
+        trigger: String,
+        pre_tokens: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    ModelRerouted { session_id: String, reason: String },
+    /// Bridge: a hook callback fired in the SDK. If `expect_response` is
+    /// true the Rust side must reply with `HookResponse { request_id }` or
+    /// the SDK will hang on this hook.
+    #[serde(rename_all = "camelCase")]
+    HookEvent {
+        session_id: String,
+        request_id: String,
+        event: String,
+        #[serde(default)] tool_use_id: Option<String>,
+        payload: Value,
+        expect_response: bool,
+    },
+    /// Bridge: a canUseTool callback fired. The SDK is blocked until the
+    /// Rust side replies with `PermissionResponse { request_id, result }`.
+    #[serde(rename_all = "camelCase")]
+    PermissionRequest {
+        session_id: String,
+        request_id: String,
+        tool_name: String,
+        tool_use_id: String,
+        input: Value,
+        #[serde(default)] suggestions: Option<Value>,
+        #[serde(default)] blocked_path: Option<String>,
+        #[serde(default)] decision_reason: Option<String>,
+        #[serde(default)] agent_id: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
     TurnCompleted {
         session_id: String,
         turn_id: String,
@@ -188,9 +304,12 @@ pub enum SidecarEvent {
         #[serde(default)] result: Option<String>,
         #[serde(default)] errors: Option<Vec<String>>,
         #[serde(default)] usage: Option<Value>,
+        #[serde(default)] model_usage: Option<Value>,
         #[serde(default)] total_cost_usd: Option<f64>,
         #[serde(default)] duration_ms: Option<u64>,
         #[serde(default)] num_turns: Option<u32>,
+        #[serde(default)] permission_denials: Option<Value>,
+        #[serde(default)] structured_output: Option<Value>,
     },
 }
 
@@ -541,6 +660,148 @@ impl SidecarClient {
             .await?;
         Ok(payload.unwrap_or(Value::Null))
     }
+
+    // --- Query control ------------------------------------------------
+
+    pub async fn set_model(&self, session_id: &str, model: Option<String>) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::SetModel {
+            id,
+            session_id: session_id.to_string(),
+            model,
+        })
+        .await
+    }
+
+    pub async fn set_permission_mode(&self, session_id: &str, mode: &str) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::SetPermissionMode {
+            id,
+            session_id: session_id.to_string(),
+            mode: mode.to_string(),
+        })
+        .await
+    }
+
+    pub async fn set_max_thinking_tokens(
+        &self,
+        session_id: &str,
+        max_thinking_tokens: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::SetMaxThinkingTokens {
+            id,
+            session_id: session_id.to_string(),
+            max_thinking_tokens,
+        })
+        .await
+    }
+
+    pub async fn set_mcp_servers(
+        &self,
+        session_id: &str,
+        servers: Value,
+    ) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::SetMcpServers {
+                id,
+                session_id: session_id.to_string(),
+                servers,
+            })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn rewind_files(
+        &self,
+        session_id: &str,
+        user_message_id: &str,
+        dry_run: Option<bool>,
+    ) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::RewindFiles {
+                id,
+                session_id: session_id.to_string(),
+                user_message_id: user_message_id.to_string(),
+                dry_run,
+            })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn supported_commands(&self, session_id: &str) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::SupportedCommands {
+                id,
+                session_id: session_id.to_string(),
+            })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn supported_models(&self, session_id: &str) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::SupportedModels {
+                id,
+                session_id: session_id.to_string(),
+            })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn mcp_server_status(&self, session_id: &str) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::McpServerStatus {
+                id,
+                session_id: session_id.to_string(),
+            })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn account_info(&self, session_id: &str) -> anyhow::Result<Value> {
+        let id = self.next_id().await;
+        let payload = self
+            .dispatch_with_payload(OutboundCommand::AccountInfo {
+                id,
+                session_id: session_id.to_string(),
+            })
+            .await?;
+        Ok(payload.unwrap_or(Value::Null))
+    }
+
+    pub async fn permission_response(
+        &self,
+        request_id: &str,
+        result: Value,
+    ) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::PermissionResponse {
+            id,
+            request_id: request_id.to_string(),
+            result,
+        })
+        .await
+    }
+
+    pub async fn hook_response(
+        &self,
+        request_id: &str,
+        output: Value,
+    ) -> anyhow::Result<()> {
+        let id = self.next_id().await;
+        self.dispatch(OutboundCommand::HookResponse {
+            id,
+            request_id: request_id.to_string(),
+            output,
+        })
+        .await
+    }
 }
 
 fn command_id(c: &OutboundCommand) -> String {
@@ -552,6 +813,17 @@ fn command_id(c: &OutboundCommand) -> String {
         | OutboundCommand::Interrupt { id, .. }
         | OutboundCommand::Compact { id, .. }
         | OutboundCommand::CloseSession { id, .. }
+        | OutboundCommand::SetModel { id, .. }
+        | OutboundCommand::SetPermissionMode { id, .. }
+        | OutboundCommand::SetMaxThinkingTokens { id, .. }
+        | OutboundCommand::SetMcpServers { id, .. }
+        | OutboundCommand::RewindFiles { id, .. }
+        | OutboundCommand::SupportedCommands { id, .. }
+        | OutboundCommand::SupportedModels { id, .. }
+        | OutboundCommand::McpServerStatus { id, .. }
+        | OutboundCommand::AccountInfo { id, .. }
+        | OutboundCommand::PermissionResponse { id, .. }
+        | OutboundCommand::HookResponse { id, .. }
         | OutboundCommand::ListSkills { id, .. }
         | OutboundCommand::ListHooks { id, .. }
         | OutboundCommand::ListMcpServers { id, .. }

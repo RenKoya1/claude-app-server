@@ -67,26 +67,79 @@ ANTHROPIC_API_KEY=sk-ant-... npx @renkoya1/claude-app-server
 
 ## Building a custom agent
 
-`thread/start` and `turn/start` are **open-ended**: any field that the
+You have **two parallel ways** to configure an agent, and you can mix
+them freely. Both produce a fully working Claude Agent SDK session
+behind the JSON-RPC surface.
+
+### Way 1 — Filesystem conventions (no code, file-based)
+
+The Claude Agent SDK auto-loads everything from the standard Claude
+Code directory layout. **Drop files in the right place and they just
+work** — no JSON-RPC config required.
+
+| Feature           | Location                                                                          | Notes                                          |
+|-------------------|-----------------------------------------------------------------------------------|------------------------------------------------|
+| Rules             | `~/.claude/CLAUDE.md` (user) and `<cwd>/CLAUDE.md` (project)                      | Injected into the system prompt.               |
+| Skills            | `~/.claude/skills/<name>/SKILL.md`, `<cwd>/.claude/skills/<name>/SKILL.md`        | The model invokes them via the `Skill` tool.   |
+| Subagents (file)  | `~/.claude/agents/<name>.md`, `<cwd>/.claude/agents/<name>.md`                    | Reachable from the `Task` tool.                |
+| Slash commands    | `~/.claude/commands/<name>.md`, `<cwd>/.claude/commands/<name>.md`                | User invokes as `/<name>`.                     |
+| Hooks             | `~/.claude/settings.json` `hooks` field                                            | PreToolUse / PostToolUse / etc.                |
+| Memories          | `~/.claude/memories/*.md`                                                          | Loaded into context as agent recall.           |
+| MCP servers       | `~/.claude/mcp.json`                                                               | Auto-connected.                                |
+| Settings          | `~/.claude/settings.json`, `<cwd>/.claude/settings.json`, `.claude/settings.local.json` | All SDK settings keys.                    |
+
+You can ship an agent as a self-contained bundle:
+
+```
+my-agent-bundle/
+├── CLAUDE.md                              # rules
+└── .claude/
+    ├── settings.json                       # SDK settings
+    ├── skills/
+    │   └── sql-expert/SKILL.md
+    ├── agents/
+    │   └── sql-reviewer.md
+    ├── commands/
+    │   └── analyze-query.md                # /analyze-query
+    └── mcp.json
+```
+
+Then tell the server to use it as the working directory:
+
+```json
+{ "method": "thread/start", "params": { "cwd": "/path/to/my-agent-bundle" } }
+```
+
+The SDK reads `CLAUDE.md`, the skills, the file subagents, the slash
+commands, and the MCP servers automatically. **No protocol options
+needed.**
+
+### Way 2 — Programmatic config via JSON-RPC
+
+`thread/start` and `turn/start` are **open-ended**: any field the
 official `@anthropic-ai/claude-agent-sdk` `Options` type accepts is
-forwarded verbatim into the underlying `query({ options })` call. No
-protocol bump is needed to use new SDK options.
+forwarded verbatim into `query({ options })`. New SDK options work
+without a protocol bump.
 
 Common knobs:
 
-| `params` key             | Effect                                                                  |
-|--------------------------|-------------------------------------------------------------------------|
-| `model`                  | Pick the model (`claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, ...). |
-| `systemPrompt`           | Replace the default Claude Code system prompt with your own.            |
-| `cwd`                    | Working directory the agent operates from.                              |
-| `additionalDirectories`  | Extra directories the agent may read/write beyond `cwd`.                |
-| `permissionMode`         | `default` / `acceptEdits` / `bypassPermissions` / `plan` / `delegate` / `dontAsk`. |
-| `allowedTools`           | Restrict the agent to a tool whitelist (e.g. `["Read", "Grep"]`).       |
-| `disallowedTools`        | Tool blacklist (e.g. `["Bash"]` to forbid shell exec).                  |
-| `maxTurns`               | Cap the autonomous tool-use loop length.                                |
-| `env`                    | Env vars passed into the agent's child processes.                       |
-| `mcpServers`             | Per-thread MCP server registration (DB connectors, internal tools, ...).|
-| `agents`                 | Programmatic subagents reachable via the `Task` tool.                   |
+| `params` key              | Effect                                                                  |
+|---------------------------|-------------------------------------------------------------------------|
+| `model`                   | Pick the model (`claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, ...). |
+| `systemPrompt`            | Replace the default Claude Code system prompt with your own.            |
+| `cwd`                     | Working directory the agent operates from.                              |
+| `additionalDirectories`   | Extra directories the agent may read/write beyond `cwd`.                |
+| `permissionMode`          | `default` / `acceptEdits` / `bypassPermissions` / `plan` / `dontAsk` / `auto`. |
+| `allowedTools`            | Restrict the agent to a tool whitelist (e.g. `["Read", "Grep"]`).       |
+| `disallowedTools`         | Tool blacklist (e.g. `["Bash"]` to forbid shell exec).                  |
+| `maxTurns`                | Cap the autonomous tool-use loop length.                                |
+| `env`                     | Env vars passed into the agent's child processes.                       |
+| `skills`                  | `"all"` or an array of skill names to enable.                           |
+| `mcpServers`              | Per-thread MCP server registration (DB connectors, internal tools, ...).|
+| `agents`                  | Programmatic subagents reachable via the `Task` tool.                   |
+| `settingSources`          | Subset of `user` / `project` / `local` to read settings from.           |
+| `bridgeCanUseTool`        | `true` → tool calls emit `item/*/requestApproval`; client replies with `permission/respond` (see *Bridged callbacks*). |
+| `bridgeHooks`             | `"all"` or array of hook events → server emits `hook/started`/`hook/completed`. |
 
 Example — a SQL-only agent with a DB-backed MCP server:
 
@@ -99,6 +152,7 @@ Example — a SQL-only agent with a DB-backed MCP server:
     "systemPrompt": "You are a SQL expert. Use the `db` MCP to query.",
     "permissionMode": "plan",
     "allowedTools": ["Read", "Grep"],
+    "skills": ["sql-expert"],
     "maxTurns": 8,
     "mcpServers": {
       "db": {
@@ -119,14 +173,88 @@ Example — a SQL-only agent with a DB-backed MCP server:
 }
 ```
 
-Notes:
+### Way 3 — Hybrid (file defaults, JSON-RPC overrides)
 
-- The frontend does **not** type-check unknown keys; the SDK will reject
+Filesystem conventions provide the baseline; JSON-RPC params override
+or extend per session. This is the most common production setup —
+ship a `.claude/` skill/agent bundle with your UI, and let the user
+flip `permissionMode`, `model`, `systemPrompt` from the UI.
+
+```json
+{
+  "method": "thread/start",
+  "params": {
+    "cwd": "/path/to/my-agent-bundle",     // file conventions load here
+    "systemPrompt": "User-selected persona", // override CLAUDE.md preset
+    "permissionMode": "plan",                // UI choice
+    "skills": ["sql-expert", "git-helper"]   // narrow file skills
+  }
+}
+```
+
+### Bridged callbacks (`canUseTool`, `hooks`)
+
+JavaScript callbacks cannot cross a JSON boundary, but the sidecar
+bridges them as request/response events:
+
+```jsonc
+// Opt-in once at thread/start:
+{ "method": "thread/start", "params": { ..., "bridgeCanUseTool": true, "bridgeHooks": "all" } }
+
+// Then server emits e.g.:
+// {"method":"item/commandExecution/requestApproval","params":{"requestId":"...","tool":"Bash","input":{...}}}
+// Client must reply:
+{ "method": "permission/respond", "id": 99, "params": { "requestId": "...", "result": { "behavior": "allow" } } }
+```
+
+Same pattern for hooks: server emits `hook/started` / `hook/completed`
+with the hook payload; client optionally replies via `hook/respond`.
+
+### Runtime control (mid-session steering)
+
+Once a session is running, mutate it without recreating:
+
+| Method                            | Effect                                                  |
+|-----------------------------------|---------------------------------------------------------|
+| `thread/model/set`                | Switch model mid-session.                               |
+| `thread/maxThinkingTokens/set`    | Adjust extended-thinking budget.                        |
+| `agent/define`                    | Add a new programmatic subagent (recreates session).    |
+| `agent/list` / `agent/remove`     | Inspect / remove current subagents.                     |
+| `mcpServer/set`                   | Reconfigure MCP servers (recreates session).            |
+| `turn/steer`                      | Append user input to the active turn without new turn.  |
+| `turn/interrupt`                  | Abort the active turn.                                  |
+
+### Feature parity with Claude Code
+
+Everything the official Claude Code CLI supports works here, with one
+exception:
+
+| SDK feature                                    | Status                                                    |
+|------------------------------------------------|-----------------------------------------------------------|
+| File-based: rules, skills, subagents, commands, hooks, memories, MCP, settings | ✅ Auto-loaded by the SDK |
+| Programmatic: `agents`, `mcpServers` (stdio/sse/http), `systemPrompt`, etc. | ✅ Pass via `thread/start params` |
+| `canUseTool` callback                          | ✅ Via `bridgeCanUseTool: true`                            |
+| `hooks` callbacks                              | ✅ Via `bridgeHooks: "all"`                                |
+| Runtime control (model, permission mode, MCP) | ✅ Via `thread/*/set` endpoints                            |
+| `createSdkMcpServer()` + `tool()` (in-process JS tool) | ⚠️ Fork the sidecar (see below)                       |
+
+For in-process JS tools, ship a custom sidecar:
+
+```bash
+# your-custom-sidecar.mjs imports claude-agent-sdk + adds tools via tool()
+CLAUDE_APP_SERVER_SIDECAR=/path/to/your-custom-sidecar.mjs \
+  npx @renkoya1/claude-app-server
+```
+
+The `CLAUDE_APP_SERVER_SIDECAR` env var lets you swap the default
+sidecar with your own — every other piece of the server (transport,
+thread store, JSON-RPC dispatch) stays intact.
+
+### Notes
+
+- The frontend does **not** type-check unknown keys; the SDK rejects
   malformed shapes and the server emits a `turn/completed` with
   `isError: true` and the SDK error in `errors[]`.
-- Some SDK options (notably `hooks` and `abortController`) are
-  JavaScript callbacks and cannot cross the JSON-RPC boundary; they are
-  ignored.
 - The full SDK `Options` reference:
   https://github.com/anthropics/claude-agent-sdk-typescript
 
