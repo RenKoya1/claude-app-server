@@ -1,6 +1,6 @@
 {
   "name": "@renkoya1/claude-app-server",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "JSON-RPC server that exposes Claude Agent SDK to any client (codex app-server compatible wire protocol).",
   "type": "module",
   "bin": {
