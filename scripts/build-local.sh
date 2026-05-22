@@ -8,25 +8,36 @@ set -euo pipefail
 PKG_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PKG_ROOT"
 
-echo "==> Building TS sidecar"
+echo "==> Building TS sidecar (with devDeps for tsc)"
 (
   cd sidecar
-  if [ ! -d node_modules ]; then npm install; fi
+  npm ci
   npx tsc -p tsconfig.json
+)
+
+echo "==> Pruning sidecar to production deps only"
+(
+  cd sidecar
+  npm prune --omit=dev
 )
 
 echo "==> Building Rust binary"
 cargo build --release -p claude-app-server
 
 echo "==> Staging dist/"
-mkdir -p dist/sidecar
 
-# Sidecar artifacts
+# Sidecar artifacts (rebuilt from scratch so stale files do not bloat).
 rm -rf dist/sidecar
-cp -R sidecar/dist dist/sidecar
-# Vendored runtime deps the sidecar pulls at import time (claude-agent-sdk).
+mkdir -p dist/sidecar
+cp -R sidecar/dist/. dist/sidecar/
 mkdir -p dist/sidecar/node_modules
 rsync -a --delete sidecar/node_modules/ dist/sidecar/node_modules/
+
+# Strip platform-specific binaries we never ship to npm.
+# (Win32 is not in package.json os whitelist; ripgrep ships per-platform
+# in the SDK and the postinstall pass on the user's machine prunes the
+# non-matching ones. We pre-strip win32 to shrink the published tarball.)
+rm -rf "dist/sidecar/node_modules/@anthropic-ai/claude-agent-sdk/vendor/ripgrep/x64-win32" || true
 
 # Rust binary for the current platform
 UNAME_OS="$(uname -s)"
